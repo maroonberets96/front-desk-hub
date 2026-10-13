@@ -217,7 +217,7 @@ def make_slip_pdf(path, loan, org):
             ("Issued by", loan["issued_by"])]
     c, new_page, footer = _sheet(path, "KEY ISSUE SLIP", f"Key slip {name}", info,
                                  f"Key slip {name} · printed {datetime.now():%d/%m/%Y %H:%M} "
-                                 "from the Front Office key log", org)
+                                 "from the Front Desk Hub key log", org)
     y = _letterhead(c, org, "KEY ISSUE SLIP", info)
     ink = HexColor(INK)
     grey = HexColor("#6b6b73")

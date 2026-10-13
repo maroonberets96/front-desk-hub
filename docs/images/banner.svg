@@ -8,8 +8,8 @@
   <rect width="1280" height="320" rx="16" fill="#18181c"/>
   <rect width="1280" height="320" rx="16" fill="url(#bg)"/>
   <g font-family="Segoe UI, -apple-system, Helvetica, Arial, sans-serif">
-    <text x="80" y="118" font-size="64" font-weight="700" fill="#f5f5f7">Front Office</text>
-    <text x="82" y="164" font-size="22" fill="#9a9aa5">The front desk on one touch screen: cash, receipts, keys, post and visitors,</text>
+    <text x="80" y="118" font-size="64" font-weight="700" fill="#f5f5f7">Front Desk Hub</text>
+    <text x="82" y="164" font-size="22" fill="#9a9aa5">Laundry, rent, petty cash, keys, post and visitors on one touch screen,</text>
     <text x="82" y="194" font-size="22" fill="#9a9aa5">with a PIN on every action and an audit trail you can't quietly edit.</text>
 
     <g font-size="18" font-weight="600" fill="#ffffff">

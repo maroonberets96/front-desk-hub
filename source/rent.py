@@ -627,7 +627,7 @@ def make_banking_sheet_pdf(path, d, pays, org):
             ("Paying-in ref", d["slip"] or "—"), ("Recorded by", d["banked_by"])]
     c, new_page, footer = _sheet(path, "BANKING SHEET", f"Banking sheet {d['deposit']}", info,
                          f"Banking sheet {d['deposit']} · printed {datetime.now():%d/%m/%Y %H:%M} "
-                         "from the Front Office rent log", org)
+                         "from the Front Desk Hub rent log", org)
     y = _letterhead(c, org, "BANKING SHEET", info)
     columns = [("Receipt", 16, "l"), ("Taken", 17, "l"), ("Tenant", 41, "l"), ("Ref", 20, "l"), ("For", 29, "l"),
                ("Cash £", 17, "r"), ("Cheque £", 17, "r"), ("Total £", 17, "r")]
@@ -684,7 +684,7 @@ def make_token_banking_sheet_pdf(path, b, petty_receipts, org):
             ("Banked by", rec["staff"])]
     c, new_page, footer = _sheet(path, "TOKEN BANKING SHEET", f"Token banking {ref}", info,
                                  f"Token banking {ref} · printed {datetime.now():%d/%m/%Y %H:%M} "
-                                 "from the Front Office token log", org)
+                                 "from the Front Desk Hub token log", org)
     y = _letterhead(c, org, "TOKEN BANKING SHEET", info)
     ink = HexColor(INK)
     left = SHEET_LEFT * mm
@@ -759,7 +759,7 @@ def make_statement_pdf(path, tenant, pays, period, org):
         raise RuntimeError("The PDF library (reportlab) is not available.")
     info = [("Tenant ref", tenant["ref"] or "—"), ("Period", period), ("Date", date.today().strftime("%d/%m/%Y"))]
     c, new_page, footer = _sheet(path, "STATEMENT OF PAYMENTS", f"Statement {tenant['name']}", info,
-                         f"Printed {datetime.now():%d/%m/%Y %H:%M} from the Front Office rent log", org)
+                         f"Printed {datetime.now():%d/%m/%Y %H:%M} from the Front Desk Hub rent log", org)
     y = _letterhead(c, org, "STATEMENT OF PAYMENTS", info)
     ink = HexColor(INK)
     left = SHEET_LEFT * mm

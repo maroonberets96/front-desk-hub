@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/images/banner.svg" alt="Front Office: laundry tokens, rent, cash drawer, keys, post and visitors" width="100%">
+  <img src="docs/images/banner.svg" alt="Front Desk Hub: laundry tokens, rent, cash drawer, petty cash, keys, post and visitors" width="100%">
 </p>
 
 <p align="center">
@@ -10,7 +10,9 @@
   <img alt="No server" src="https://img.shields.io/badge/server-none-8b6cf0">
 </p>
 
-A desktop app for a small office front desk, made for a touch-screen PC at the counter. It replaces the paper receipt book, the token tin, the key book, the post book and the visitor book. Every action needs a staff PIN, and each record is kept in a log that flags any edit made outside the app.
+**Front Desk Hub** runs every job at a small office's front desk from one touch-screen PC at the counter. Staff use it to sell laundry tokens, take rent and print receipts, and run the cash drawer and petty cash. It also lends out keys, logs recorded post and keeps the visitor book.
+
+It replaces the paper receipt book, the token tin, the petty cash tin, the key book, the post book and the visitor book. Every action needs a staff PIN, and each record is kept in a log that flags any edit made outside the app.
 
 It needs no server, database or install: one `.exe` and a `data` folder next to it.
 
@@ -18,13 +20,14 @@ It needs no server, database or install: one `.exe` and a `data` folder next to 
 
 | | Tab | What it does |
 |---|---|---|
-| 🔵 | **Home** | Today at a glance: takings, receipts waiting to be checked, cash not yet banked, overdue keys, post waiting to be handed over, and visitors still signed in |
-| 🟢 | **Laundry** | Point of sale for washing and dryer tokens, by flat. Opens the cash drawer through a USB trigger. Voids, token stock and reports by day or by flat |
-| 🟩 | **Rent** | Rent, arrears and deposits taken at the desk, each with a numbered PDF receipt. A second person checks the money into the safe, then it's banked with a printed banking sheet |
-| 🟠 | **Drawer** | Cash in the drawer now, no sale and change, counts, petty cash, and emptying the drawer for banking |
-| 🔶 | **Keys** | Keys lent to contractors, with a printed slip to sign. Shows what's still out and what's overdue, and records part-returns and lost keys |
+| 🔵 | **Home** | Today at a glance: takings, receipts waiting to be checked, cash not yet banked, overdue keys, post waiting to be handed over, and visitors still signed in. When nobody is using it, the screen shows a clock and counts only, with no money on show |
+| 🟢 | **Laundry** | Point of sale for washing and dryer tokens, by flat, which opens the cash drawer through a USB trigger. Includes each flat's purchase history, token stock (deliveries and counts), voids, and reports by day or by flat |
+| 🟩 | **Rent** | Rent, arrears and deposits taken at the desk, each with a numbered receipt that prints straight away. A second person checks the money into the safe, then it's banked with a printed banking sheet. Receipts can be previewed, reprinted or cancelled, and each tenant's payment statement printed |
+| 🟠 | **Drawer** | Cash in the drawer now, no sale and change, counts, voids and emptying the drawer for banking. **Petty cash**: money taken out against a reason, settled later with the receipt total and a photo of each receipt from the webcam |
+| 🔶 | **Keys** | Keys lent to contractors, with a printed slip to sign. Shows what's still out and what's overdue, and records returns, part-returns and lost keys |
 | 🟣 | **Post** | Recorded post in (handed over to whom, and when) and out (method, tracking number, cost) |
 | 🩷 | **Visitors** | The visitor book, filled in by staff, with sign-in and sign-out times |
+| ⚙️ | **Settings** | Staff and PINs, tenants, flats, properties, contractors, token prices, receipt numbering, the cash drawer, touch-screen mode, and a check of every log |
 
 ## Paperwork it prints
 
@@ -77,12 +80,12 @@ pip install pyinstaller
 source\build_exe.bat
 ```
 
-This builds `Front Office.exe` as a single file in the repository root. To brand it, put a `logo.png` (and optionally an `app.ico`) in `source/` before you build. To have rent receipts print straight to the default printer, also put `SumatraPDF.exe` there; without it, each receipt opens as a PDF to print by hand.
+This builds `Front Desk Hub.exe` as a single file in the repository root. To brand it, put a `logo.png` (and optionally an `app.ico`) in `source/` before you build. To have rent receipts print straight to the default printer, also put `SumatraPDF.exe` there; without it, each receipt opens as a PDF to print by hand.
 
 ## Updating a live install
 
 1. Press **Exit** in the app.
-2. Rename the old `Front Office.exe` to `Front Office.exe.old`, as a way back.
+2. Rename the old `Front Desk Hub.exe` to `Front Desk Hub.exe.old`, as a way back.
 3. Copy in the new `.exe` and start it.
 
 Never copy `data/`, `receipts/`, `banking/`, `keys/` or `backups/` from a test copy. They hold the live records.

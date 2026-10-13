@@ -1,6 +1,6 @@
 """
-Front Office
-=================
+Front Desk Hub
+==============
 
 The office's app, in tabs that share staff, PINs, settings and backups but keep their
 money and logs completely separate:
@@ -25,7 +25,7 @@ Laundry tokens:
   * Daily backups of the sales log in the backups folder
 
 Folder layout (the folder holding the .exe; when run from source, the folder above source/):
-  Front Office.exe
+  Front Desk Hub.exe
   data/
     config.json      settings, prices, staff (PINs are stored hashed)
     tenants.csv      Laundry block flats: Flat, Tenant Name
@@ -79,7 +79,7 @@ except ImportError:  # the logo is then scaled with Tk's own (coarser) PNG suppo
 # Constants
 # --------------------------------------------------------------------------
 
-APP_TITLE = "Front Office"
+APP_TITLE = "Front Desk Hub"
 DEFAULT_FLAT_COUNT = 29
 DEFAULT_PIN = "1234"
 
@@ -674,6 +674,9 @@ class PlaceholderEntry(tk.Entry):
             self.config(fg=DIM)
 
     def _focus_in(self, _):
+        self.drop_placeholder()
+
+    def drop_placeholder(self):
         if self._showing:
             self.delete(0, "end")
             self.config(fg=TEXT)
@@ -793,6 +796,10 @@ def type_into(w, text):
     """Types text into a box as a key press would: replaces any selection, then fires <KeyRelease>
     so search boxes and totals update as they do from the keyboard."""
     try:
+        # the on-screen keyboard can take focus for a moment as it appears, and an empty box then
+        # shows its grey hint again: typed into, the letter would be lost with the hint
+        if getattr(w, "_showing", False):
+            w.drop_placeholder()
         if w.winfo_class() == "Text":
             if w.tag_ranges("sel"):
                 w.delete("sel.first", "sel.last")
@@ -810,6 +817,8 @@ def type_into(w, text):
 
 def backspace_in(w):
     try:
+        if getattr(w, "_showing", False):  # only the grey hint is in the box: nothing to delete
+            return
         if w.winfo_class() == "Text":
             if w.tag_ranges("sel"):
                 w.delete("sel.first", "sel.last")
