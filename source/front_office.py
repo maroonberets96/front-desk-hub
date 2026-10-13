@@ -18,7 +18,8 @@ Laundry tokens:
   * Tenants are picked from tenants.csv (flat number + name)
   * Every transaction needs a staff PIN; the staff member is recorded
   * Opens a cash drawer through a USB trigger box (virtual COM port)
-  * Petty cash: money taken out of the drawer, logged with amount and reason
+  * Petty cash: an advance taken out of the drawer (amount and reason), open until it's settled
+    with the receipt total; the change goes back in the drawer (or an overspend is paid out)
   * Append-only audit log in sales_log.csv (voids are new rows, never edits)
   * Daily totals, reports by day / by flat / petty cash, CSV export
   * Daily backups of the sales log in the backups folder
@@ -29,11 +30,13 @@ Folder layout (the folder holding the .exe; when run from source, the folder abo
     config.json      settings, prices, staff (PINs are stored hashed)
     tenants.csv      Laundry block flats: Flat, Tenant Name
     sales_log.csv    every sale, void, petty cash payment and no-sale drawer opening
-                     (petty cash rows have a negative total: cash leaving the drawer),
-                     the drawer emptied for banking (BANKED, negative total),
+                     (petty cash rows have a negative total: cash leaving the drawer;
+                     PETTY SETTLED rows, Ref = the advance, have the change returned as the total),
+                     cash taken out for banking (BANKED, negative total; the drawer figure restarts),
+                     then any cash left in the drawer as a float (KEPT IN DRAWER, positive total),
                      plus token stock received and counted (no money: total 0)
     (rent files: see rent.py; key files: keys.py; post_log.csv: post.py; visitor_log.csv: visitors.py)
-  receipts/          rent receipts as issued (PDF)
+  receipts/          rent receipts as issued (PDF); "petty cash" holds receipt photos from the camera
   banking/           banking sheet for each rent deposit (PDF)
   keys/              key slips printed for contractors to sign (PDF)
   backups/           one copy of each log per day, last 60 kept
@@ -95,6 +98,8 @@ CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 TENANTS_PATH = os.path.join(DATA_DIR, "tenants.csv")
 SALES_PATH = os.path.join(DATA_DIR, "sales_log.csv")
 BACKUP_DIR = os.path.join(BASE_DIR, "backups")
+# Photos of petty cash receipts taken with the PC's camera: <year>\PettyCash_<petty #>_<hand-in #>_<n>.jpg
+PETTY_PHOTO_DIR = os.path.join(BASE_DIR, "receipts", "petty cash")
 ERROR_LOG_PATH = os.path.join(DATA_DIR, "error.log")
 # Files that older versions kept next to the .exe; moved into data/ on start-up.
 DATA_FILES = ("config.json", "tenants.csv", "sales_log.csv", "rent_log.csv", "rent_tenants.csv", "error.log")
@@ -116,17 +121,24 @@ TYPE_SALE = "SALE"
 TYPE_VOID = "VOID"
 TYPE_NOSALE = "NO SALE"
 TYPE_COUNT = "DRAWER COUNT"       # cash counted: Total = counted minus expected, so the drawer figure matches
-TYPE_PETTY = "PETTY CASH"
+TYPE_PETTY = "PETTY CASH"         # a petty cash advance: Total = minus the cash taken out
+# An advance settled with its receipt: Ref = the advance, Total = the change put back (minus an
+# overspend paid out), so what was spent is the advance plus this.
+TYPE_PETTY_SETTLE = "PETTY SETTLED"
 TYPE_ACCEPTED = "LOG ACCEPTED"  # an admin accepted a log that was changed outside the app
 TYPE_STOCK_IN = "STOCK IN"        # tokens received into the office (Washing/Dryer Qty = tokens added)
 TYPE_STOCK_COUNT = "STOCK COUNT"  # tokens counted by hand (Qty = counted minus expected)
 STOCK_TYPES = (TYPE_STOCK_IN, TYPE_STOCK_COUNT)
-# The drawer emptied and paid into the bank (token takings account). Total = minus the cash
-# taken out. The drawer is always emptied fully, so what should be in it is everything since.
+# Cash taken out of the drawer and paid into the bank (token takings account). Total = minus the
+# cash taken out. The drawer figure restarts from 0 here, so what should be in it is everything since.
 TYPE_BANKED = "BANKED"
+# Cash counted at banking but left in the drawer (e.g. £50 kept as a float). Written straight
+# after its BANKED row; Total = the cash left, so it opens the next banking period.
+TYPE_KEPT = "KEPT IN DRAWER"
 DEFAULT_LOW_STOCK = 50
 DEFAULT_BANK_LIMITS = {"drawer": 200, "rent": 1500}  # £; Home highlights money waiting to be banked above this
 DEFAULT_IDLE_MINUTES = 3
+DEFAULT_MAX_FLOAT = 50  # £ staff may leave in the drawer when banking (0 = must bank it all)
 
 # ESC/POS "kick drawer" command. The trigger box fires on any byte, and this
 # also works if a receipt printer is ever put in between.
@@ -168,6 +180,15 @@ globals().update(THEMES["dark"])
 def apply_theme(name):
     globals().update(THEMES.get(name, THEMES["dark"]))
 FONT = "Segoe UI"
+
+# Settings → General → Touch screen. On: no hover effects, an on-screen keyboard when a box is
+# tapped, a number pad for PINs, and taller buttons (those need a restart, like the colours).
+TOUCH = False
+
+
+def apply_touch(on):
+    global TOUCH
+    TOUCH = bool(on)
 
 
 # --------------------------------------------------------------------------
@@ -338,7 +359,8 @@ def row_to_record(row):
     if receipt is None or dt is None or total is None:
         return None
     rtype = (row.get("Type") or TYPE_SALE).strip().upper()
-    if rtype not in (TYPE_SALE, TYPE_VOID, TYPE_NOSALE, TYPE_COUNT, TYPE_PETTY, TYPE_ACCEPTED, TYPE_BANKED) + STOCK_TYPES:
+    if rtype not in (TYPE_SALE, TYPE_VOID, TYPE_NOSALE, TYPE_COUNT, TYPE_PETTY, TYPE_PETTY_SETTLE, TYPE_ACCEPTED,
+                     TYPE_BANKED, TYPE_KEPT) + STOCK_TYPES:
         return None
     return {
         "receipt": receipt,
@@ -562,13 +584,16 @@ class HoverButton(tk.Button):
                     highlightthickness=0, cursor="hand2", font=font or (FONT, 11, "bold"),
                     disabledforeground=DIM, padx=14, pady=8)
         opts.update(kw)
+        if TOUCH:  # at least about 40 px tall, so a fingertip can't miss it
+            opts["pady"] = max(opts["pady"], 10)
         super().__init__(master, **opts)
         self._bg, self._hover, self._fg = bg, hover, fg
         self.bind("<Enter>", self._on_enter, add="+")
         self.bind("<Leave>", self._on_leave, add="+")
 
     def _on_enter(self, _):
-        if str(self["state"]) != "disabled":
+        # a tap never sends the matching <Leave>, so on a touch screen the hover colour would stick
+        if not TOUCH and str(self["state"]) != "disabled":
             self.config(bg=self._hover)
 
     def _on_leave(self, _):
@@ -682,6 +707,7 @@ class TokenStepper(tk.Frame):
     def __init__(self, master, title, color, hover, on_change):
         super().__init__(master, bg=PANEL_2)
         self.qty = 0
+        self.stock = None  # tokens in the office; a sale can't be for more (None: stock not tracked)
         self._on_change = on_change
         tk.Frame(self, bg=color, width=4).pack(side="left", fill="y")
         self.plus = HoverButton(self, text="+", bg=color, hover=hover, font=(FONT, 16, "bold"),
@@ -704,21 +730,555 @@ class TokenStepper(tk.Frame):
 
     def set_stock(self, count, low):
         """count: tokens in stock, or None when stock isn't tracked."""
+        self.stock = None if count is None else max(0, count)
         if count is None:
             self.stock_label.pack_forget()
-            return
-        self.stock_label.config(text=f"{count} in stock" + ("  ·  low" if count < low else ""),
-                                fg=AMBER if count < low else MUTED)
-        self.stock_label.pack(fill="x")
+        elif self.stock == 0:
+            self.stock_label.config(text="Out of stock", fg=RED)
+            self.stock_label.pack(fill="x")
+        else:
+            self.stock_label.config(text=f"{count} in stock" + ("  ·  low" if count < low else ""),
+                                    fg=AMBER if count < low else MUTED)
+            self.stock_label.pack(fill="x")
+        if self.qty > self.limit():
+            self.set(self.qty)  # stock went down (e.g. a count) below what's in the basket
+        else:
+            self.plus.set_enabled(self.qty < self.limit())
+
+    def limit(self):
+        return self.MAX_QTY if self.stock is None else min(self.MAX_QTY, self.stock)
 
     def change(self, delta):
         self.set(self.qty + delta)
 
     def set(self, qty):
-        self.qty = max(0, min(self.MAX_QTY, qty))
+        self.qty = max(0, min(self.limit(), qty))
         self.qty_label.config(text=str(self.qty), fg=TEXT if self.qty else MUTED)
         self.minus.set_enabled(self.qty > 0)
+        self.plus.set_enabled(self.qty < self.limit())
         self._on_change()
+
+
+# --------------------------------------------------------------------------
+# Touch screen: on-screen keyboard, number pad, drag to scroll
+# --------------------------------------------------------------------------
+
+TEXT_CLASSES = ("Entry", "TEntry", "TCombobox", "Text")
+
+
+def is_text_box(w):
+    """True for a box that can be typed in now (not disabled or read-only)."""
+    try:
+        if w.winfo_class() not in TEXT_CLASSES:
+            return False
+        if w.winfo_class() in ("TEntry", "TCombobox"):
+            return not w.instate(["disabled"]) and not w.instate(["readonly"])
+        return str(w.cget("state")) == "normal"
+    except (tk.TclError, AttributeError):
+        return False
+
+
+def _see_insert(w):
+    """Scrolls a long entry so the cursor stays in view, as Tk does for real key presses."""
+    try:
+        if w.winfo_class() == "Entry":
+            w.tk.call("tk::EntrySeeInsert", w)
+        else:
+            w.tk.call("ttk::entry::See", w, "insert")
+    except tk.TclError:
+        pass
+
+
+def type_into(w, text):
+    """Types text into a box as a key press would: replaces any selection, then fires <KeyRelease>
+    so search boxes and totals update as they do from the keyboard."""
+    try:
+        if w.winfo_class() == "Text":
+            if w.tag_ranges("sel"):
+                w.delete("sel.first", "sel.last")
+            w.insert("insert", text)
+            w.see("insert")
+        else:
+            if w.selection_present():
+                w.delete("sel.first", "sel.last")
+            w.insert("insert", text)
+            _see_insert(w)
+        w.event_generate("<KeyRelease>")
+    except tk.TclError:
+        pass
+
+
+def backspace_in(w):
+    try:
+        if w.winfo_class() == "Text":
+            if w.tag_ranges("sel"):
+                w.delete("sel.first", "sel.last")
+            else:
+                w.delete("insert-1c")
+        elif w.selection_present():
+            w.delete("sel.first", "sel.last")
+        elif w.index("insert") > 0:
+            w.delete(w.index("insert") - 1)
+        w.event_generate("<KeyRelease>")
+    except tk.TclError:
+        pass
+
+
+class TouchKeyboard:
+    """Pops up when a text box is tapped (Settings → General → Touch screen). Windows' own touch
+    keyboard doesn't notice Tk's boxes, so it can't be relied on to appear.
+    The keyboard window belongs to the tapped box's window, so it still works inside a dialog that
+    has the grab, and goes when that dialog closes. It sits at the bottom of the screen beside the
+    form the box is in, so it doesn't cover the form's other boxes. Where there's no room beside
+    (a dialog in the middle of the screen) it goes full width at the bottom, or at the top if it
+    would cover the box.
+    A box marked with number_box() gets a small number pad beside its form instead: the extra key
+    is "." for money, "/" for a date and a space for a phone number."""
+
+    ROWS = [list("1234567890") + ["⌫"],
+            list("qwertyuiop") + ["'"],
+            list("asdfghjkl") + ["@", "Enter"],
+            ["⇧"] + list("zxcvbnm") + [",", ".", "-"],
+            ["£", "/", "&", "Space", "_", "#", "Hide"]]
+    WIDE = {"⌫": 2, "Enter": 2, "⇧": 2, "Space": 6, "Hide": 2}
+    PAD_EXTRA = {"money": ".", "date": "/", "phone": "Space"}
+
+    def pad_rows(self, kind):
+        return [list("123"), list("456"), list("789"), [self.PAD_EXTRA.get(kind, ""), "0", "⌫"], ["Hide", "Enter"]]
+
+    def __init__(self, app):
+        self.app = app
+        self.win = None
+        self.mode = None  # None: the full keyboard; otherwise the number_box() kind
+        self.target = None
+        self.shift = False
+        self.letter_keys = []
+        for cls in TEXT_CLASSES:
+            app.bind_class(cls, "<ButtonRelease-1>", self._tapped, add="+")
+        app.bind_all("<FocusIn>", self._focus_moved, add="+")
+
+    def _tapped(self, event):
+        w = event.widget
+        if TOUCH and is_text_box(w) and not getattr(w, "numpad", False):
+            self.show(w)
+
+    def _focus_moved(self, _):
+        # Tk also sends <FocusIn> to the frames around a box, so look at where focus ends up
+        if self.win is not None:
+            self.app.after_idle(self._check_focus)
+
+    def _check_focus(self):
+        if self.win is None or not self.win.winfo_exists():
+            return
+        try:
+            w = self.app.focus_get()
+        except (tk.TclError, KeyError):  # e.g. focus in a file dialog
+            return
+        # a window getting focus (e.g. the keyboard appearing) isn't a box being left
+        if w is None or isinstance(w, (tk.Tk, tk.Toplevel)) or str(w).startswith(str(self.win)):
+            return
+        if w is not self.target and (not is_text_box(w) or getattr(w, "numpad", False)
+                                     or w.winfo_toplevel() is not self.win.master):
+            self.hide()
+
+    def show(self, target):
+        self.target = target
+        top = target.winfo_toplevel()
+        mode = getattr(target, "numeric", None)
+        if self.win is None or not self.win.winfo_exists() or self.win.master is not top or mode != self.mode:
+            self.hide()
+            self.mode = mode
+            self._build(top)
+        self._place()
+        self.win.deiconify()
+        self.win.lift()
+
+    def hide(self):
+        if self.win is not None:
+            try:
+                self.win.destroy()
+            except tk.TclError:
+                pass
+        self.win = None
+
+    def _build(self, top):
+        S = self.app.S
+        self.win = win = tk.Toplevel(top, bg=BG, highlightthickness=1, highlightbackground=BORDER)
+        win.withdraw()
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        self.letter_keys = []
+        for keys in self.pad_rows(self.mode) if self.mode else self.ROWS:
+            row = tk.Frame(win, bg=BG)
+            row.pack(fill="x", padx=S(4), pady=(S(4), 0))
+            for i, key in enumerate(keys):
+                row.columnconfigure(i, weight=self.WIDE.get(key, 1), uniform="key")
+                if not key:
+                    continue
+                accent = key in ("Enter", "Hide")
+                btn = HoverButton(row, text=key, font=(FONT, 18 if self.mode else 15, "bold" if accent else "normal"),
+                                  bg=TEAL if key == "Enter" else GREY_BTN,
+                                  hover=TEAL_HOVER if key == "Enter" else GREY_HOVER,
+                                  fg="#ffffff" if key == "Enter" else TEXT, padx=0, pady=S(10),
+                                  takefocus=0, command=lambda k=key: self._press(k))
+                btn.grid(row=0, column=i, sticky="nsew", padx=S(2))
+                if key.isalpha() and len(key) == 1:
+                    self.letter_keys.append(btn)
+        tk.Frame(win, bg=BG, height=S(4)).pack()
+        self.shift = False
+        win.update_idletasks()
+        try:  # don't take focus from the box being typed in when a key is tapped
+            hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
+            style = ctypes.windll.user32.GetWindowLongW(hwnd, -20)  # GWL_EXSTYLE
+            ctypes.windll.user32.SetWindowLongW(hwnd, -20, style | 0x08000000)  # WS_EX_NOACTIVATE
+        except (AttributeError, OSError):
+            pass
+
+    def _column(self, t):
+        """Left and right screen edges of the form the box is in: on the main window the panel
+        holding it (e.g. the Rent form down the left), in a dialog the whole dialog."""
+        top = t.winfo_toplevel()
+        col = top
+        if top is self.app:
+            w = t
+            while w is not top and w.winfo_width() < top.winfo_width() // 2:
+                col, w = w, w.master
+        return col.winfo_rootx(), col.winfo_rootx() + col.winfo_width()
+
+    def _beside(self, t, w, sw):
+        """x for a window w wide beside the box's form, so it covers none of the form's other
+        boxes: to its right, else its left. None if there's no room either side."""
+        left, right = self._column(t)
+        gap = self.app.S(10)
+        if sw - right - gap >= w:
+            return right + gap
+        if left - gap >= w:
+            return left - gap - w
+        return None
+
+    def _place(self):
+        win, t = self.win, self.target
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        win.update_idletasks()
+        h = win.winfo_reqheight()
+        if self.mode:  # the number pad goes beside the form, level with the box
+            w, gap = self.app.S(300), self.app.S(6)
+            x = self._beside(t, w, sw)
+            if x is not None:
+                y = min(max(0, t.winfo_rooty() + t.winfo_height() // 2 - h // 2), sh - h)
+            else:  # no room beside: just below the box, or above it
+                x = min(max(0, t.winfo_rootx()), sw - w)
+                y = t.winfo_rooty() + t.winfo_height() + gap
+                if y + h > sh:
+                    y = max(0, t.winfo_rooty() - h - gap)
+            win.geometry(f"{w}x{h}+{x}+{y}")
+            return
+        # the keyboard goes along the bottom beside the form, so the boxes under this one stay
+        # in view; a narrower keyboard is fine, down to about three-quarters of full width
+        full = self.app.S(1180)
+        left, right = self._column(t)
+        gap = self.app.S(10)
+        if self._beside(t, self.app.S(880), sw) is not None:
+            if sw - right - gap >= self.app.S(880):
+                w = min(full, sw - right - gap)
+                x = right + gap
+            else:
+                w = min(full, left - gap)
+                x = left - gap - w
+            win.geometry(f"{w}x{h}+{x}+{sh - h}")
+            return
+        w = min(sw, full)
+        y = sh - h
+        top = t.winfo_toplevel()
+        if top is not self.app:  # move a dialog up so its OK/Cancel buttons aren't under the keys
+            overlap = top.winfo_rooty() + top.winfo_height() - y
+            if overlap > 0:
+                top.geometry(f"+{top.winfo_x()}+{max(0, top.winfo_y() - overlap)}")
+                top.update_idletasks()
+        if t.winfo_rooty() + t.winfo_height() > y - self.app.S(10):
+            y = 0
+        win.geometry(f"{w}x{h}+{(sw - w) // 2}+{y}")
+
+    def _press(self, key):
+        t = self.target
+        if self.win is None or t is None or not t.winfo_exists():
+            self.hide()
+            return
+        if key == "Hide":
+            self.hide()
+            return
+        t.focus_set()
+        if key == "⇧":
+            self._set_shift(not self.shift)
+        elif key == "⌫":
+            backspace_in(t)
+        elif key == "Enter":
+            t.event_generate("<Return>")
+        else:
+            type_into(t, " " if key == "Space" else key.upper() if self.shift else key)
+            if self.shift and key.isalpha():
+                self._set_shift(False)
+
+    def _set_shift(self, on):
+        self.shift = on
+        for btn in self.letter_keys:
+            btn.config(text=btn.cget("text").upper() if on else btn.cget("text").lower())
+
+
+def friendly_date(d, today=None):
+    """'today', 'yesterday', 'tomorrow', or e.g. 'Thu 1 Oct' (with the year if it isn't this year)."""
+    today = today or date.today()
+    if isinstance(d, datetime):
+        d = d.date()
+    name = {0: "today", -1: "yesterday", 1: "tomorrow"}.get((d - today).days)
+    if name:
+        return name
+    text = f"{d:%a} {d.day} {d:%b}"
+    return text if d.year == today.year else f"{text} {d.year}"
+
+
+class CardList(tk.Frame):
+    """A list of cards in place of a table's rows: a bold first line, one or two quieter lines under
+    it, a coloured bar down the left and a status badge on the right. Tall enough to tap, and it
+    scrolls by dragging (finger or mouse) as well as with the wheel and scrollbar.
+    Fill it with clear(), add() for each row, then finish(). Only the first PAGE cards are built;
+    a "Show more" button at the end builds the next lot, so long lists stay quick.
+    selection(), selection_set() and exists() work like a Treeview's. Normally one card is selected
+    at a time; with multi=True each tap ticks or unticks a card, with "Select all" and "Clear" above
+    the list (e.g. to bank several payments together)."""
+
+    PAGE = 60
+
+    def __init__(self, master, app, on_open=None, multi=False):
+        super().__init__(master, bg=PANEL)
+        self.app, self.on_open, self.multi = app, on_open, multi
+        S = app.S
+        if multi:
+            head = tk.Frame(self, bg=PANEL)
+            head.pack(side="top", fill="x", pady=(0, S(6)))
+            self.count_label = tk.Label(head, text="", font=(FONT, 10), fg=MUTED, bg=PANEL)
+            self.count_label.pack(side="left")
+            for text, command in (("Clear", lambda: self.selection_set([])), ("Select all", self.select_all)):
+                HoverButton(head, text=text, font=(FONT, 9, "bold"), padx=10, pady=3,
+                            command=command).pack(side="right", padx=(6, 0))
+        self.canvas = tk.Canvas(self, bg=PANEL, highlightthickness=0, bd=0, yscrollincrement=1)
+        sb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y", padx=(S(6), 0))
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.inner = tk.Frame(self.canvas, bg=PANEL)
+        self._window = self.canvas.create_window(0, 0, window=self.inner, anchor="nw")
+        self.inner.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfigure(self._window, width=e.width))
+        # every widget in the list gets this tag, so a press anywhere on a card selects or drags it
+        self.tag = f"CardList{id(self)}"
+        for seq, fn in (("<ButtonPress-1>", self._press), ("<B1-Motion>", self._drag),
+                        ("<ButtonRelease-1>", self._release), ("<Double-1>", self._double),
+                        ("<MouseWheel>", self._wheel)):
+            self.bind_class(self.tag, seq, fn)
+        self._wire(self.canvas, None)
+        self._wire(self.inner, None)
+        self.items, self.cards, self.chosen, self.shown = [], {}, [], 0
+        self._drag_from = self._dragged = None
+        self._opened = False
+
+    # ---- filling ---------------------------------------------------------
+    def clear(self):
+        for w in self.inner.winfo_children():
+            w.destroy()
+        self.items, self.cards, self.shown = [], {}, 0
+
+    def add(self, iid, title, lines=(), badge="", color=None, quiet=False, faded=False, flagged=False):
+        """color: the left bar and badge. quiet: the badge is just coloured text, for something
+        finished with (e.g. returned) so it doesn't shout like what still needs doing. faded: greys
+        the title (e.g. voided). flagged: changed outside the app (the log's warning colours)."""
+        self.items.append(dict(iid=str(iid), title=title, lines=[l for l in lines if l], badge=badge,
+                               color=color or GREY_BTN, quiet=quiet, faded=faded, flagged=flagged))
+
+    def finish(self):
+        self._build_page()
+        self.chosen = [i for i in self.chosen if self.exists(i)]
+        self._show_count()
+
+    def scroll_top(self):
+        self.canvas.yview_moveto(0)
+
+    def _build_page(self):
+        for w in self.inner.winfo_children():
+            if getattr(w, "more_button", False):
+                w.destroy()
+        for item in self.items[self.shown:self.shown + self.PAGE]:
+            self._build_card(item)
+        self.shown = min(len(self.items), self.shown + self.PAGE)
+        left = len(self.items) - self.shown
+        if left:
+            more = HoverButton(self.inner, text=f"Show more ({left} older)", font=(FONT, 10, "bold"),
+                               command=self._build_page)
+            more.more_button = True
+            more.pack(fill="x", pady=(0, self.app.S(6)))
+            self._wire(more, None)
+
+    def _build_card(self, item):
+        S = self.app.S
+        bg = TAMPERED_BG if item["flagged"] else PANEL_2
+        card = tk.Frame(self.inner, bg=bg, highlightthickness=2, highlightbackground=PANEL, highlightcolor=PANEL)
+        card.pack(fill="x", pady=(0, S(6)))
+        tk.Frame(card, bg=item["color"], width=S(5)).pack(side="left", fill="y")
+        if item["badge"]:
+            tk.Label(card, text=item["badge"], font=(FONT, 10, "bold"),
+                     fg=item["color"] if item["quiet"] else "#ffffff", bg=PANEL if item["quiet"] else item["color"],
+                     padx=S(10), pady=S(3)).pack(side="right", anchor="n", padx=S(14), pady=S(12))
+        body = tk.Frame(card, bg=bg)
+        body.pack(side="left", fill="both", expand=True, padx=(S(14), S(8)), pady=S(9))
+        title_fg = TAMPERED_FG if item["flagged"] else DIM if item["faded"] else TEXT
+        tk.Label(body, text=item["title"], font=(FONT, 12, "bold"), fg=title_fg, bg=bg,
+                 anchor="w").pack(fill="x")
+        for i, line in enumerate(item["lines"]):
+            fg = TAMPERED_FG if item["flagged"] else MUTED if i == 0 else DIM
+            tk.Label(body, text=line, font=(FONT, 10), fg=fg, bg=bg, anchor="w").pack(fill="x", pady=(S(2), 0))
+        self.cards[item["iid"]] = card
+        if item["iid"] in self.chosen:
+            self._paint(item["iid"], True)
+        # body is one of card's children: wiring it twice would make a tap tick and untick at once
+        for w in (card, *card.winfo_children(), *body.winfo_children()):
+            self._wire(w, item["iid"])
+
+    def _wire(self, w, iid):
+        w.card_iid = iid
+        w.bindtags((self.tag,) + w.bindtags())
+
+    # ---- selection -------------------------------------------------------
+    def selection(self):
+        return tuple(i for i in self.chosen if self.exists(i))
+
+    def selection_set(self, iids):
+        iids = [iids] if isinstance(iids, str) else [str(i) for i in iids]
+        for i in self.chosen:
+            self._paint(i, False)
+        self.chosen = [i for i in iids if self.exists(i)][:None if self.multi else 1]
+        for i in self.chosen:
+            self._paint(i, True)
+        self._show_count()
+
+    def select_all(self):
+        self.selection_set([item["iid"] for item in self.items])
+
+    def exists(self, iid):
+        return any(item["iid"] == str(iid) for item in self.items)
+
+    def select(self, iid):
+        """A tap: picks the card, or with multi ticks or unticks it."""
+        iid = str(iid)
+        if not self.multi:
+            self.selection_set([iid])
+        elif iid in self.chosen:
+            self.selection_set([i for i in self.chosen if i != iid])
+        else:
+            self.selection_set(self.chosen + [iid])
+
+    def _show_count(self):
+        if self.multi:
+            n = len(self.chosen)
+            self.count_label.config(text=f"{n} selected" if n else "Tap to select (several at once is fine)",
+                                    fg=TEXT if n else MUTED)
+
+    def _paint(self, iid, on):
+        if iid not in self.cards:
+            return
+        try:
+            self.cards[iid].config(highlightbackground=TEAL if on else PANEL, highlightcolor=TEAL if on else PANEL)
+        except tk.TclError:
+            pass
+
+    # ---- touch and mouse -------------------------------------------------
+    def _press(self, e):
+        self._drag_from, self._last_y, self._dragged = e.y_root, e.y_root, False
+
+    def _drag(self, e):
+        if self._drag_from is None:
+            return
+        if not self._dragged and abs(e.y_root - self._drag_from) < self.app.S(8):
+            return  # a tap wobbles a little: only a real move scrolls
+        self._dragged = True
+        self.canvas.yview_scroll(self._last_y - e.y_root, "units")
+        self._last_y = e.y_root
+
+    def _release(self, e):
+        if not self._dragged and not self._opened and getattr(e.widget, "card_iid", None) is not None:
+            self.select(e.widget.card_iid)
+        self._drag_from, self._opened = None, False
+
+    def _double(self, e):
+        iid = getattr(e.widget, "card_iid", None)
+        if iid is not None and self.on_open:
+            self.selection_set([iid])
+            self._opened = True  # the second tap's release mustn't untick it again
+            self.on_open()
+
+    def _wheel(self, e):
+        self.canvas.yview_scroll(int(-e.delta / 120 * self.app.S(60)), "units")
+
+
+def number_box(w, kind="money"):
+    """Marks a box as taking numbers: on a touch screen it gets a number pad, not the keyboard.
+    kind: 'money', 'number', 'date', 'phone' or 'pin'."""
+    w.numeric = kind
+    return w
+
+
+def add_number_pad(parent, target, decimal=False):
+    """A big 0–9 pad for a touch screen. target() gives the box to type into. Returns the pad."""
+    pad = tk.Frame(parent, bg=PANEL)
+    keys = list("123456789") + (["."] if decimal else [""]) + ["0", "⌫"]
+    for i, key in enumerate(keys):
+        pad.columnconfigure(i % 3, weight=1, uniform="pad")
+        if not key:
+            continue
+        HoverButton(pad, text=key, font=(FONT, 18, "bold"), padx=0, pady=8, takefocus=0,
+                    command=lambda k=key: _number_key(target(), k)).grid(
+            row=i // 3, column=i % 3, sticky="nsew", padx=3, pady=3)
+    return pad
+
+
+def _number_key(w, key):
+    if w is None:
+        return
+    w.focus_set()
+    if key == "⌫":
+        backspace_in(w)
+    else:
+        type_into(w, key)
+
+
+def enable_drag_scroll(app):
+    """Lists scroll when dragged with a finger (or the mouse), a row at a time. A tap still just
+    selects: the list only moves once the finger has gone a row's height."""
+    def row_height(tree):
+        style = tree.cget("style") or "Treeview"
+        try:
+            return max(8, int(ttk.Style(tree).lookup(style, "rowheight") or 20))
+        except (tk.TclError, ValueError):
+            return 20
+
+    def start(e):
+        # dragging a heading or column edge resizes columns, as before
+        on_rows = e.widget.identify_region(e.x, e.y) not in ("heading", "separator")
+        e.widget._drag = [e.y, 0] if on_rows else None
+
+    def move(e):
+        drag = getattr(e.widget, "_drag", None)
+        if drag is None:
+            return
+        drag[1] += e.y - drag[0]
+        drag[0] = e.y
+        rh = row_height(e.widget)
+        while abs(drag[1]) >= rh:
+            step = -1 if drag[1] > 0 else 1  # finger moves down: show earlier rows
+            e.widget.yview_scroll(step, "units")
+            drag[1] += rh * step
+
+    app.bind_class("Treeview", "<ButtonPress-1>", start, add="+")
+    app.bind_class("Treeview", "<B1-Motion>", move, add="+")
 
 
 # --------------------------------------------------------------------------
@@ -852,11 +1412,21 @@ class PinDialog(Dialog):
         self.pin = tk.Entry(self.body, show="•", width=10, justify="center", validate="key",
                             validatecommand=vcmd, **entry_opts(font=(FONT, 20)))
         self.pin.pack(fill="x", ipady=4)
+        if TOUCH:  # the pad types into whichever number box was last tapped
+            numeric = [w for w in (self.amount, self.given, self.pin) if w is not None]
+            self.number_box = self.amount or self.pin  # cash given is optional: start on the PIN
+            for w in numeric:
+                w.numpad = True  # no on-screen keyboard for these: the pad is here
+                w.bind("<FocusIn>", lambda e, w=w: setattr(self, "number_box", w), add="+")
+            add_number_pad(self.body, lambda: self.number_box,
+                           decimal=len(numeric) > 1).pack(fill="x", pady=(10, 0))
         self.error = tk.Label(self.body, text="", font=(FONT, 10), fg=RED, bg=PANEL, anchor="w",
                               justify="left", wraplength=380)
         self.error.pack(fill="x", pady=(6, 0))
         self.button_row(confirm_text, confirm_bg, confirm_hover)
         self._initial_focus = next(w for w in (self.amount, self.given, self.reason, self.pin) if w is not None)
+        if TOUCH:  # the cursor starts where the pad types
+            self._initial_focus = self.number_box
 
     def _show_change(self):
         given = parse_pence(self.given_var.get())
@@ -924,7 +1494,8 @@ def admin_save_path(app, parent, **kw):
 
 
 class FieldsDialog(Dialog):
-    """Small form. fields: dicts with key, label, kind ('text'|'pin'|'check'), value."""
+    """Small form. fields: dicts with key, label, kind, value. kind: 'text', 'pin' or 'check', or
+    'money', 'number', 'date' or 'phone' (a text box that gets the number pad on a touch screen)."""
 
     def __init__(self, parent, title, heading, fields, validate=None, confirm_text="Save", sub=None):
         super().__init__(parent, title)
@@ -947,6 +1518,8 @@ class FieldsDialog(Dialog):
                 extra = dict(show="•", validate="key", validatecommand=pin_vcmd) if kind == "pin" else {}
                 entry = tk.Entry(self.body, textvariable=var, width=36, **extra, **entry_opts())
                 entry.pack(fill="x", ipady=5)
+                if kind in ("pin", "money", "number", "date", "phone"):
+                    number_box(entry, kind)
                 if self._initial_focus is None:
                     self._initial_focus = entry
             self.vars[f["key"]] = var
@@ -969,13 +1542,290 @@ class FieldsDialog(Dialog):
         self.close()
 
 
+class PettyPickDialog(Dialog):
+    """Which petty cash is this receipt for? One button per entry waiting for a receipt.
+    result = the petty cash record picked."""
+
+    def __init__(self, parent, waiting):
+        super().__init__(parent, "Hand in receipt")
+        self.heading("Which petty cash is the receipt for?")
+        for rec in waiting:
+            HoverButton(self.body, text=f"#{rec['receipt']}   {fmt_money(-rec['total'])}   {rec['notes']}\n"
+                                        f"{rec['staff']}  ·  {rec['dt']:%d/%m/%Y %H:%M}",
+                        font=(FONT, 11, "bold"), justify="left", anchor="w",
+                        command=lambda r=rec: self.pick(r)).pack(fill="x", pady=(10, 0))
+        row = tk.Frame(self.body, bg=PANEL)
+        row.pack(fill="x", pady=(18, 0))
+        HoverButton(row, text="Cancel", command=self.cancel).pack(side="right")
+
+    def pick(self, rec):
+        self.result = rec
+        self.close()
+
+
+class ReceiptsDialog(Dialog):
+    """Handing in petty cash receipts: one line per shop receipt (where from, amount, an optional
+    photo), with the change worked out as they type. result = [{"shop", "pence", "photo"}]."""
+
+    def __init__(self, parent, rec):
+        super().__init__(parent, "Hand in receipt")
+        self.taken, self.taken_by = -rec["total"], rec["staff"]
+        self.heading(f"Petty cash #{rec['receipt']}: {fmt_money(self.taken)} taken",
+                     f"For {rec['notes']} · taken by {rec['staff']} on {rec['dt']:%d/%m/%Y %H:%M}. "
+                     f"Write #{rec['receipt']} on each receipt and keep them with the petty cash receipts.")
+        self.label("Receipts  ·  one line for each receipt")
+        self.rows_frame = tk.Frame(self.body, bg=PANEL)
+        self.rows_frame.pack(fill="x")
+        self.rows = []
+        HoverButton(self.body, text="+  Add another receipt", font=(FONT, 10, "bold"), padx=10, pady=4,
+                    command=self.add_row).pack(anchor="w", pady=(4, 0))
+        self.summary = tk.Label(self.body, text="", font=(FONT, 14, "bold"), fg=MUTED, bg=PANEL, anchor="w",
+                                justify="left", wraplength=480)
+        self.summary.pack(fill="x", pady=(16, 0))
+        self.error = tk.Label(self.body, text="", font=(FONT, 10), fg=RED, bg=PANEL, anchor="w",
+                              justify="left", wraplength=480)
+        self.error.pack(fill="x", pady=(6, 0))
+        self.button_row("Next", PURPLE, PURPLE_HOVER)
+        self.add_row()
+        self._initial_focus = self.rows[0]["shop"]
+
+    def add_row(self):
+        frame = tk.Frame(self.rows_frame, bg=PANEL)
+        frame.pack(fill="x", pady=(0, 6))
+        row = {"frame": frame, "photo": None}
+        row["shop"] = PlaceholderEntry(frame, "Where from? e.g. Tesco", width=24)
+        row["shop"].pack(side="left", fill="x", expand=True, ipady=5)
+        row["amount"] = number_box(PlaceholderEntry(frame, "£ amount", width=9))
+        row["amount"].pack(side="left", padx=(6, 0), ipady=5)
+        row["amount"].bind("<KeyRelease>", lambda e: self.update_summary(), add="+")
+        row["photo_btn"] = HoverButton(frame, text="📷 Scan", font=(FONT, 10, "bold"), padx=10, pady=4,
+                                       command=lambda: self.take_photo(row))
+        row["photo_btn"].pack(side="left", padx=(6, 0))
+        HoverButton(frame, text="✕", font=(FONT, 10, "bold"), padx=8, pady=4,
+                    command=lambda: self.remove_row(row)).pack(side="left", padx=(6, 0))
+        self.rows.append(row)
+        if len(self.rows) > 1:
+            row["shop"].focus_set()
+        self.update_summary()
+
+    def remove_row(self, row):
+        if len(self.rows) == 1:
+            return
+        row["frame"].destroy()
+        self.rows.remove(row)
+        self.update_summary()
+
+    def take_photo(self, row):
+        photo = CameraDialog(self).show()
+        if photo is not None:
+            row["photo"] = photo
+            row["photo_btn"].set_colors(GREEN, GREEN_HOVER, "#ffffff")
+            row["photo_btn"].config(text="✓ Scanned")
+
+    def update_summary(self):
+        amounts = [parse_pence(r["amount"].value()) for r in self.rows]
+        spent = sum(p for p in amounts if p and p > 0)
+        back = self.taken - spent
+        if not spent:
+            self.summary.config(text="Enter the amount on each receipt.", fg=MUTED)
+        elif back > 0:
+            self.summary.config(text=f"Spent {fmt_money(spent)}  ·  put {fmt_money(back)} change back", fg=GREEN)
+        elif back == 0:
+            self.summary.config(text=f"Spent {fmt_money(spent)}  ·  no change", fg=GREEN)
+        else:
+            self.summary.config(text=f"Spent {fmt_money(spent)}  ·  {fmt_money(-back)} more than was taken "
+                                     f"(paid to {self.taken_by} from the drawer)", fg=AMBER)
+
+    def confirm(self):
+        out = []
+        for n, r in enumerate(self.rows, 1):
+            shop, text = r["shop"].value(), r["amount"].value()
+            if not shop and not text and r["photo"] is None and len(self.rows) > 1:
+                continue  # an extra line left empty
+            pence = parse_pence(text)
+            if not shop:
+                self.error.config(text=f"Receipt {n}: where is it from?")
+                r["shop"].focus_set()
+                return
+            if not pence or pence < 0:
+                self.error.config(text=f"Receipt {n}: enter the amount on the receipt, e.g. 12.50")
+                r["amount"].focus_set()
+                return
+            out.append({"shop": shop, "pence": pence, "photo": r["photo"]})
+        self.result = out
+        self.close()
+
+
+RECEIPT_GUIDE = (0.32, 0.03, 0.68, 0.97)  # the box the receipt is held in: left, top, right, bottom (of the frame)
+
+
+def guide_box(width, height):
+    left, top, right, bottom = RECEIPT_GUIDE
+    return int(width * left), int(height * top), int(width * right), int(height * bottom)
+
+
+def scan_receipt(cv2, frame):
+    """Turns a camera frame into a scan of the receipt: only what's inside the guide box is kept
+    (never the person holding it), the receipt's edges are found and straightened if they can be,
+    and shadows are flattened so the paper is white. Returns (greyscale PIL Image, edges found)."""
+    import numpy as np  # comes with cv2
+    x0, y0, x1, y1 = guide_box(frame.shape[1], frame.shape[0])
+    grey = cv2.cvtColor(frame[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
+    corners = find_receipt(cv2, np, grey)
+    if corners is not None:
+        s, d = corners.sum(axis=1), np.diff(corners, axis=1).ravel()
+        tl, br, tr, bl = corners[s.argmin()], corners[s.argmax()], corners[d.argmin()], corners[d.argmax()]
+        width = int(max(np.linalg.norm(tr - tl), np.linalg.norm(br - bl)))
+        height = int(max(np.linalg.norm(bl - tl), np.linalg.norm(br - tr)))
+        target = np.array([[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]], dtype="float32")
+        grey = cv2.warpPerspective(grey, cv2.getPerspectiveTransform(np.array([tl, tr, br, bl]), target),
+                                   (width, height))
+    background = cv2.medianBlur(cv2.dilate(grey, np.ones((7, 7), np.uint8)), 21)
+    return Image.fromarray(cv2.divide(grey, background, scale=255)), corners is not None
+
+
+def find_receipt(cv2, np, grey):
+    """The receipt's four corners in the picture, or None if no clear receipt-shaped outline is
+    found. Looks for its outline, then for bright paper, and only accepts a shape that is mostly
+    a filled rectangle covering a good part of the box."""
+    blur = cv2.GaussianBlur(grey, (5, 5), 0)
+    outline = cv2.morphologyEx(cv2.Canny(blur, 40, 120), cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+    paper = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+    paper = cv2.morphologyEx(paper, cv2.MORPH_CLOSE, np.ones((25, 25), np.uint8))
+    for mask in (outline, paper):
+        contours = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]
+        if not contours:
+            continue
+        contour = cv2.convexHull(max(contours, key=cv2.contourArea))
+        area = cv2.contourArea(contour)
+        rect = cv2.minAreaRect(contour)
+        (w, h) = rect[1]
+        if not 0.2 * grey.size <= area <= 0.97 * grey.size or min(w, h) < 60 or area < 0.85 * w * h:
+            continue
+        quad = cv2.approxPolyDP(contour, 0.02 * cv2.arcLength(contour, True), True)
+        return (quad if len(quad) == 4 else cv2.boxPoints(rect)).reshape(4, 2).astype("float32")
+    return None
+
+
+class CameraDialog(Dialog):
+    """Scans a receipt with the PC's camera: a live view with a box to hold the receipt in, and
+    only the receipt is kept (see scan_receipt). result = the scan (PIL Image)."""
+    PREVIEW = (720, 405)
+
+    def __init__(self, parent):
+        super().__init__(parent, "Scan receipt")
+        self.cam = self.frame = self.shot = self._job = None
+        self.heading("Scan the receipt", "Hold the receipt flat inside the white box, close to the camera, then "
+                                         "press Take photo. Only what's inside the box is kept.")
+        box = tk.Frame(self.body, bg="#000000", width=self.PREVIEW[0], height=self.PREVIEW[1])
+        box.pack(pady=(12, 0))
+        box.pack_propagate(False)
+        self.view = tk.Label(box, text="Starting the camera…", font=(FONT, 11), fg="#9a9aa5", bg="#000000")
+        self.view.pack(fill="both", expand=True)
+        self.hint = tk.Label(self.body, text="", font=(FONT, 10), fg=AMBER, bg=PANEL, anchor="w", justify="left",
+                             wraplength=self.PREVIEW[0])
+        self.hint.pack(fill="x", pady=(6, 0))
+        self.dark_frames = 0
+        row = tk.Frame(self.body, bg=PANEL)
+        row.pack(fill="x", pady=(18, 0))
+        HoverButton(row, text="Cancel", command=self.cancel).pack(side="right")
+        self.take_btn = HoverButton(row, text="Take photo", bg=TEAL, hover=TEAL_HOVER, fg="#ffffff",
+                                    command=self.take)
+        self.take_btn.pack(side="right", padx=(0, 8))
+        self.use_btn = HoverButton(row, text="Use photo", bg=GREEN, hover=GREEN_HOVER, fg="#ffffff",
+                                   command=self.confirm)
+        self.bind("<Return>", lambda e: self.confirm() if self.shot is not None else self.take())
+        self.after(100, self.start)
+
+    def start(self):
+        try:
+            import cv2
+        except ImportError:
+            cv2 = None
+        if cv2 is None or Image is None:
+            self._fail("The camera can't be used in this version of the app.")
+            return
+        self.cv2 = cv2
+        cam = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+        if not cam.isOpened():
+            cam.release()
+            self._fail("No camera was found, or another program is using it.")
+            return
+        cam.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        cam.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        self.cam = cam
+        self._tick()
+
+    def _fail(self, problem):
+        messagebox.showwarning("Camera", problem + "\n\nYou can still hand in the receipt without a photo.",
+                               parent=self)
+        self.cancel()
+
+    def _tick(self):
+        ok, frame = self.cam.read()
+        if ok:
+            self.frame = frame
+            # dim everything outside the box the receipt goes in
+            x0, y0, x1, y1 = guide_box(frame.shape[1], frame.shape[0])
+            view = self.cv2.convertScaleAbs(frame, alpha=0.35)
+            view[y0:y1, x0:x1] = frame[y0:y1, x0:x1]
+            self.cv2.rectangle(view, (x0, y0), (x1, y1), (255, 255, 255), 3)
+            self._show(Image.fromarray(self.cv2.cvtColor(view, self.cv2.COLOR_BGR2RGB)))
+            # a black picture for a few seconds: the camera is covered or Windows is blocking it
+            self.dark_frames = self.dark_frames + 1 if frame.mean() < 8 else 0
+            self.hint.config(text="The picture is black. Check the camera's privacy cover or switch is open, and in "
+                                  "Windows Settings > Privacy & security > Camera, that desktop apps may use the camera."
+                             if self.dark_frames > 75 else "")
+        self._job = self.after(40, self._tick)
+
+    def _show(self, image):
+        preview = image.copy()
+        preview.thumbnail(self.PREVIEW)
+        self._preview = ImageTk.PhotoImage(preview)
+        self.view.config(image=self._preview, text="")
+
+    def take(self):
+        if self.frame is None:
+            return
+        if self.shot is None:  # freeze the picture
+            self.after_cancel(self._job)
+            self._job = None
+            self.shot = scan_receipt(self.cv2, self.frame)[0]
+            self._show(self.shot)
+            self.hint.config(text="Can you read the total? If not, press Retake and hold the receipt closer, "
+                                  "all of it inside the box.", fg=MUTED)
+            self.take_btn.config(text="Retake")
+            self.use_btn.pack(side="right", padx=(0, 8))
+        else:
+            self.shot = None
+            self.hint.config(text="", fg=AMBER)
+            self.use_btn.pack_forget()
+            self.take_btn.config(text="Take photo")
+            self._tick()
+
+    def confirm(self):
+        if self.shot is not None:
+            self.result = self.shot
+            self.close()
+
+    def close(self):
+        if self._job:
+            self.after_cancel(self._job)
+            self._job = None
+        if self.cam is not None:
+            self.cam.release()
+            self.cam = None
+        super().close()
+
+
 # --------------------------------------------------------------------------
 # Reports window
 # --------------------------------------------------------------------------
 
 def summarise(records, petty_receipts=frozenset()):
     """Token takings and petty cash are kept apart. petty_receipts is the set of receipt
-    numbers that are petty cash, so voids of petty cash count against petty cash, not takings.
+    numbers that are petty cash (advances and settlements), so voids of them count against
+    petty cash, not takings. Change returned on settling reduces petty cash on the day it came back.
     by_day values are [washing, dryer, takings, sales, petty cash]."""
     s = {"wash": 0, "dry": 0, "total": 0, "sales": 0, "voids": 0, "nosales": 0,
          "petty": 0, "petty_count": 0, "by_day": {}, "by_flat": {}}
@@ -983,11 +1833,11 @@ def summarise(records, petty_receipts=frozenset()):
         if r["type"] == TYPE_NOSALE:
             s["nosales"] += 1
             continue
-        if r["type"] in (TYPE_ACCEPTED, TYPE_BANKED, TYPE_COUNT) or r["type"] in STOCK_TYPES:
-            continue  # a drawer count corrects the cash in the drawer; it isn't takings
+        if r["type"] in (TYPE_ACCEPTED, TYPE_BANKED, TYPE_KEPT, TYPE_COUNT) or r["type"] in STOCK_TYPES:
+            continue  # a drawer count or a float kept corrects the cash in the drawer; it isn't takings
         day = s["by_day"].setdefault(r["dt"].date(), [0, 0, 0, 0, 0])
-        if r["type"] == TYPE_PETTY or (r["type"] == TYPE_VOID and r["ref"] in petty_receipts):
-            s["petty"] -= r["total"]  # petty cash rows are negative, their voids positive
+        if r["type"] in (TYPE_PETTY, TYPE_PETTY_SETTLE) or (r["type"] == TYPE_VOID and r["ref"] in petty_receipts):
+            s["petty"] -= r["total"]  # advances are negative; change returned and voids positive
             day[4] -= r["total"]
             if r["type"] == TYPE_PETTY:
                 s["petty_count"] += 1
@@ -1035,33 +1885,66 @@ def token_stock(records):
 
 
 def drawer_expected(records):
-    """Cash that should be in the drawer now: every sale, void, petty cash payment and count
-    correction since it was last emptied for banking."""
+    """Cash that should be in the drawer now: what was kept in it at the last banking, plus every
+    sale, void, petty cash payment and count correction since."""
     last = max((i for i, r in enumerate(records) if r["type"] == TYPE_BANKED), default=-1)
     return sum(r["total"] for r in records[last + 1:] if r["type"] != TYPE_BANKED)
 
 
-def bankings(records):
-    """Every time the drawer was emptied for banking, oldest first, with the transactions it
-    covered: {"rec", "rows", "expected", "paid", "difference", "slip"}."""
-    out, since = [], []
+def petty_advances(records):
+    """Every petty cash advance by receipt number, oldest first: {"rec", "settled", "voided"}.
+    settled is the settlement row (a voided settlement doesn't count), so an advance is open
+    until it is settled with its receipt or voided. Spent = -(rec total + settled total)."""
+    voided = {r["ref"] for r in records if r["type"] == TYPE_VOID and r["ref"] is not None}
+    out = {r["receipt"]: {"rec": r, "settled": None, "voided": r["receipt"] in voided}
+           for r in records if r["type"] == TYPE_PETTY}
     for r in records:
+        if r["type"] == TYPE_PETTY_SETTLE and r["ref"] in out and r["receipt"] not in voided:
+            out[r["ref"]]["settled"] = r
+    return out
+
+
+def open_advances(records):
+    return [a["rec"] for a in petty_advances(records).values() if not a["voided"] and a["settled"] is None]
+
+
+def petty_photo_path(settle, n):
+    return os.path.join(PETTY_PHOTO_DIR, settle["dt"].strftime("%Y"),
+                        f"PettyCash_{settle['ref']}_{settle['receipt']}_{n}.jpg")
+
+
+def petty_photos(settle):
+    """The receipt photos saved when this petty cash receipt was handed in."""
+    return sorted(glob.glob(petty_photo_path(settle, "*")), key=natural_key)
+
+
+def bankings(records):
+    """Every banking, oldest first, with the transactions it covered (starting with any cash kept
+    at the banking before): {"rec", "rows", "expected", "paid", "kept", "counted", "difference", "slip"}.
+    kept = cash left in the drawer, from the KEPT IN DRAWER row straight after the BANKED row."""
+    out, since = [], []
+    for i, r in enumerate(records):
         if r["type"] == TYPE_BANKED:
             expected = sum(x["total"] for x in since)
-            out.append({"rec": r, "rows": since, "expected": expected, "paid": -r["total"],
-                        "difference": -r["total"] - expected, "slip": banking_slip(r)})
+            nxt = records[i + 1] if i + 1 < len(records) else None
+            kept = nxt["total"] if nxt and nxt["type"] == TYPE_KEPT else 0
+            counted = -r["total"] + kept
+            out.append({"rec": r, "rows": since, "expected": expected, "paid": -r["total"], "kept": kept,
+                        "counted": counted, "difference": counted - expected, "slip": banking_slip(r)})
             since = []
         else:
             since.append(r)
     return out
 
 
-def banking_note(slip, expected, paid):
-    diff = paid - expected
+def banking_note(slip, expected, counted, paid):
+    diff = counted - expected
     text = f"Slip {slip}" if slip else "No slip ref"
-    text += f" · expected {fmt_money(expected)}, counted {fmt_money(paid)}"
+    text += f" · expected {fmt_money(expected)}, counted {fmt_money(counted)}"
     if diff:
         text += f" ({'over' if diff > 0 else 'short'} {fmt_money(abs(diff))})"
+    if counted != paid:
+        text += f" · banked {fmt_money(paid)}, kept {fmt_money(counted - paid)} in the drawer"
     return text
 
 
@@ -1082,10 +1965,10 @@ class ReportsWindow(Dialog):
         bar = tk.Frame(self.body, bg=PANEL)
         bar.pack(fill="x", pady=(16, 0))
         tk.Label(bar, text="From", font=(FONT, 10, "bold"), fg=MUTED, bg=PANEL).pack(side="left")
-        self.from_entry = tk.Entry(bar, width=11, **entry_opts())
+        self.from_entry = number_box(tk.Entry(bar, width=11, **entry_opts()), "date")
         self.from_entry.pack(side="left", padx=(6, 12), ipady=4)
         tk.Label(bar, text="To", font=(FONT, 10, "bold"), fg=MUTED, bg=PANEL).pack(side="left")
-        self.to_entry = tk.Entry(bar, width=11, **entry_opts())
+        self.to_entry = number_box(tk.Entry(bar, width=11, **entry_opts()), "date")
         self.to_entry.pack(side="left", padx=(6, 8), ipady=4)
         HoverButton(bar, text="Show", bg=TEAL, hover=TEAL_HOVER, font=(FONT, 10, "bold"),
                     command=self.run).pack(side="left", padx=(0, 16))
@@ -1133,23 +2016,34 @@ class ReportsWindow(Dialog):
                                               ("wash", "Washing", 100, "e"), ("dry", "Dryer", 100, "e"),
                                               ("total", "Spent", 120, "e")])
         self.petty_tree = self._make_tree(nb, [("receipt", "#", 60, "w"), ("datetime", "Date & time", 140, "w"),
-                                               ("amount", "Amount", 100, "e"), ("notes", "What for", 320, "w"),
-                                               ("staff", "Staff", 120, "w"), ("status", "Status", 100, "w")])
+                                               ("amount", "Taken", 90, "e"), ("spent", "Spent", 90, "e"),
+                                               ("back", "Change back", 100, "e"), ("notes", "What for", 300, "w"),
+                                               ("staff", "Staff", 120, "w"), ("status", "Status", 150, "w")])
         self.petty_tree.tag_configure("voided", foreground=DIM, font=(FONT, 10, "overstrike"))
         self.bank_tree = self._make_tree(nb, [("ref", "Ref", 70, "w"), ("date", "Paid in", 140, "w"),
                                               ("expected", "Should have been", 130, "e"),
-                                              ("paid", "Paid in", 110, "e"), ("diff", "Difference", 110, "e"),
+                                              ("paid", "Paid in", 110, "e"), ("kept", "Kept in drawer", 120, "e"),
+                                              ("diff", "Difference", 110, "e"),
                                               ("slip", "Paying-in ref", 130, "w"), ("staff", "Banked by", 120, "w")])
         self.bank_tree.configure(selectmode="browse")
         self.bank_tree.tag_configure("off", foreground=AMBER)
         nb.add(self.day_tree.master, text="By day")
         nb.add(self.flat_tree.master, text="By flat  (double-click for history)")
         self.flat_tree.bind("<Double-1>", self._open_flat_history)
-        nb.add(self.petty_tree.master, text="Petty cash")
+        nb.add(self.petty_tree.master, text="Petty cash  (double-click for receipt photos)")
+        self.petty_tree.bind("<Double-1>", self._open_petty_photos)
         nb.add(self.bank_tree.master, text="Banking")
+        # the same as double-clicking a row, which a finger doesn't always manage
+        for tree, text, command in ((self.flat_tree, "History for the selected flat", self._open_flat_history),
+                                    (self.petty_tree, "Receipt photos for the selected advance",
+                                     self._open_petty_photos)):
+            bar = tk.Frame(tree.master, bg=PANEL)
+            bar.pack(side="bottom", fill="x", pady=(8, 0), before=tree)
+            HoverButton(bar, text=text, font=(FONT, 10, "bold"), command=command).pack(side="left")
 
         foot = tk.Frame(self.body, bg=PANEL)
-        foot.pack(fill="x", pady=(14, 0))
+        # packed before the tabs, so a short window shrinks the table rather than hiding these buttons
+        foot.pack(side="bottom", fill="x", pady=(14, 0), before=nb)
         HoverButton(foot, text="Close", command=self.cancel).pack(side="right")
         HoverButton(foot, text="Export by flat…", font=(FONT, 10, "bold"),
                     command=self.export_by_flat).pack(side="left")
@@ -1222,15 +2116,13 @@ class ReportsWindow(Dialog):
                                                     fmt_money(pc), fmt_money(t - pc)),
                                  tags=("odd" if i % 2 else "even",))
 
-        voided = self.app.voided_receipts()
         self.petty_tree.delete(*self.petty_tree.get_children())
-        petty = [r for r in self.rows if r["type"] == TYPE_PETTY]
-        for i, r in enumerate(reversed(petty)):
-            is_voided = r["receipt"] in voided
-            self.petty_tree.insert("", "end", values=(r["receipt"], r["dt"].strftime("%d/%m/%Y %H:%M"),
-                                                      fmt_money(-r["total"]), r["notes"], r["staff"],
-                                                      "Voided" if is_voided else ""),
-                                   tags=("odd" if i % 2 else "even",) + (("voided",) if is_voided else ()))
+        money = lambda p: "" if p is None else fmt_money(p)
+        for i, (rec, taken, spent, back, status) in enumerate(reversed(self.petty_rows())):
+            self.petty_tree.insert("", "end", values=(rec["receipt"], rec["dt"].strftime("%d/%m/%Y %H:%M"),
+                                                      money(taken), money(spent), money(back), rec["notes"],
+                                                      rec["staff"], status),
+                                   tags=("odd" if i % 2 else "even",) + (("voided",) if status == "Voided" else ()))
 
         self.bankings = [b for b in bankings(self.app.records) if start <= b["rec"]["dt"].date() <= end]
         self.bank_tree.delete(*self.bank_tree.get_children())
@@ -1238,7 +2130,7 @@ class ReportsWindow(Dialog):
             diff = b["difference"]
             self.bank_tree.insert("", "end", iid=str(b["rec"]["receipt"]), values=(
                 f"T{b['rec']['receipt']}", b["rec"]["dt"].strftime("%d/%m/%Y %H:%M"), fmt_money(b["expected"]),
-                fmt_money(b["paid"]), (f"{'over' if diff > 0 else 'short'} {fmt_money(abs(diff))}" if diff else "—"),
+                fmt_money(b["paid"]), fmt_money(b["kept"]) if b["kept"] else "—", (f"{'over' if diff > 0 else 'short'} {fmt_money(abs(diff))}" if diff else "—"),
                 b["slip"], b["rec"]["staff"]), tags=("odd" if i % 2 else "even",) + (("off",) if diff else ()))
 
         current_names = {t["flat"]: t["name"] for t in self.app.tenants}
@@ -1249,10 +2141,31 @@ class ReportsWindow(Dialog):
             self.flat_tree.insert("", "end", iid=flat, values=(flat, name, v["wash"], v["dry"], fmt_money(v["total"])),
                                   tags=("odd" if i % 2 else "even",))
 
-    def _open_flat_history(self, event):
-        flat = self.flat_tree.identify_row(event.y)
+    def _picked_row(self, tree, event, what):
+        """The row double-clicked, or (from a button) the selected one."""
+        if event is not None:
+            return tree.identify_row(event.y)
+        rows = tree.selection()
+        if not rows:
+            messagebox.showinfo("Reports", f"Pick {what} first.", parent=self)
+            return ""
+        return rows[0]
+
+    def _open_flat_history(self, event=None):
+        flat = self._picked_row(self.flat_tree, event, "a flat on the By flat tab")
         if flat:
             TenantHistoryWindow(self, self.app, flat).show()
+
+    def _open_petty_photos(self, event=None):
+        row = self._picked_row(self.petty_tree, event, "a petty cash advance on the Petty cash tab")
+        if not row:
+            return
+        settled = petty_advances(self.app.records)[int(self.petty_tree.item(row, "values")[0])]["settled"]
+        photos = petty_photos(settled) if settled else []
+        if not photos:
+            messagebox.showinfo("Receipt photos", "There are no receipt photos for this petty cash.", parent=self)
+        for path in photos:
+            os.startfile(path)
 
     def _ask_path(self, kind):
         start, end = self.range
@@ -1283,23 +2196,46 @@ class ReportsWindow(Dialog):
         self._export("by_day", ["Date", "Washing Qty", "Dryer Qty", "Sales", "Takings (£)",
                                 "Petty Cash (£)", "Net Cash (£)"], rows)
 
+    def petty_rows(self):
+        """Petty cash taken in the range, oldest first: (rec, taken, spent, change back, status).
+        Spent and change back are None until the receipt is handed in (they may be dated later)."""
+        advances = petty_advances(self.app.records)
+        out = []
+        for r in self.rows:
+            if r["type"] != TYPE_PETTY:
+                continue
+            a, taken = advances[r["receipt"]], -r["total"]
+            settled = a["settled"]
+            if a["voided"]:
+                out.append((r, taken, None, None, "Voided"))
+            elif settled is None:
+                out.append((r, taken, None, None, "Open: no receipt yet"))
+            else:
+                status = f"Receipt in #{settled['receipt']} · {settled['dt']:%d/%m/%Y}"
+                photos = len(petty_photos(settled))
+                if photos:
+                    status += f" · {photos} photo{'s' if photos != 1 else ''}"
+                out.append((r, taken, taken - settled["total"], settled["total"], status))
+        return out
+
     def export_petty(self):
-        voided = self.app.voided_receipts()
-        rows = [[r["receipt"], r["dt"].strftime(CSV_DATE_FMT), csv_money(-r["total"]), r["notes"], r["staff"],
-                 "Voided" if r["receipt"] in voided else ""]
-                for r in self.rows if r["type"] == TYPE_PETTY]
-        rows.append(["TOTAL", "", csv_money(self.summary["petty"]), "after voids", "", ""])
-        self._export("petty_cash", ["Receipt No", "Date & Time", "Amount (£)", "What For", "Staff", "Status"], rows)
+        money = lambda p: "" if p is None else csv_money(p)
+        rows = [[rec["receipt"], rec["dt"].strftime(CSV_DATE_FMT), money(taken), money(spent), money(back),
+                 rec["notes"], rec["staff"], status] for rec, taken, spent, back, status in self.petty_rows()]
+        rows.append(["TOTAL", "", "", "", "", f"net petty cash {csv_money(self.summary['petty'])} after change "
+                     "returned and voids", "", ""])
+        self._export("petty_cash", ["Receipt No", "Date & Time", "Taken (£)", "Spent (£)", "Change Back (£)",
+                                    "What For", "Staff", "Status"], rows)
 
     def export_banking(self):
         rows = [[f"T{b['rec']['receipt']}", b["rec"]["dt"].strftime(CSV_DATE_FMT), csv_money(b["expected"]),
-                 csv_money(b["paid"]), csv_money(b["difference"]), b["slip"], b["rec"]["staff"]]
+                 csv_money(b["paid"]), csv_money(b["kept"]), csv_money(b["difference"]), b["slip"], b["rec"]["staff"]]
                 for b in self.bankings]
         rows.append(["TOTAL", "", csv_money(sum(b["expected"] for b in self.bankings)),
-                     csv_money(sum(b["paid"] for b in self.bankings)),
+                     csv_money(sum(b["paid"] for b in self.bankings)), "",
                      csv_money(sum(b["difference"] for b in self.bankings)), "", ""])
         self._export("banking", ["Banking Ref", "Date & Time", "Should Have Been (£)", "Paid In (£)",
-                                 "Difference (£)", "Paying-in Ref", "Banked By"], rows)
+                                 "Kept In Drawer (£)", "Difference (£)", "Paying-in Ref", "Banked By"], rows)
 
     def banking_sheet(self):
         sel = self.bank_tree.selection()
@@ -1511,8 +2447,8 @@ class StockWindow(Dialog):
             return None
 
         res = FieldsDialog(self, title, heading, [
-            {"key": "wash", "label": "Washing tokens"},
-            {"key": "dry", "label": "Dryer tokens"},
+            {"key": "wash", "label": "Washing tokens", "kind": "number"},
+            {"key": "dry", "label": "Dryer tokens", "kind": "number"},
             {"key": "note", "label": note_label},
         ], validate=validate, confirm_text="Next", sub=sub).show()
         if not res:
@@ -1582,9 +2518,12 @@ class SettingsWindow(Dialog):
         super().__init__(app, "Settings", resizable=True)
         self.app = app
         self.admin = admin
-        self.geometry(f"{app.S(1240)}x{app.S(660)}")
+        self.geometry(f"{app.S(1240)}x{min(app.S(760), self.winfo_screenheight() - app.S(60))}")
         self.minsize(app.S(1180), app.S(560))
         self.heading("Settings", f"Signed in as {admin['name']} (admin)")
+        foot = tk.Frame(self.body, bg=PANEL)
+        foot.pack(side="bottom", fill="x", pady=(14, 0))  # first, so a short window can't hide Close
+        HoverButton(foot, text="Close", command=self.cancel).pack(side="right")
         nb = ttk.Notebook(self.body)
         nb.pack(fill="both", expand=True, pady=(14, 0))
         rent, keys = app.rent_module, app.keys_module
@@ -1600,9 +2539,6 @@ class SettingsWindow(Dialog):
             inner.pack(fill="both", expand=True, padx=18, pady=16)
             builder(inner)
             nb.add(frame, text=text)
-        foot = tk.Frame(self.body, bg=PANEL)
-        foot.pack(fill="x", pady=(14, 0))
-        HoverButton(foot, text="Close", command=self.cancel).pack(side="right")
 
     # ---- small builders --------------------------------------------------
     @staticmethod
@@ -1715,9 +2651,18 @@ class SettingsWindow(Dialog):
                 ("bank_rent", "Highlight when rent waiting to be banked (awaiting check + in safe) goes over £ "
                               "(0 = never)", self.app.bank_limit("rent")),
                 ("bank_drawer", "Highlight when the token cash drawer goes over £ (0 = never)",
-                 self.app.bank_limit("drawer"))]):
-            self._label(p, label, top=0 if i == 0 else 12)
-            entry = tk.Entry(p, width=8, **entry_opts())
+                 self.app.bank_limit("drawer")),
+                ("max_float", "Most cash staff may leave in the drawer when banking £ (0 = must bank it all)",
+                 self.app.max_float() // 100)]):
+            if i == 0:  # two columns, so the whole tab fits without scrolling
+                grid = tk.Frame(p, bg=PANEL)
+                grid.pack(fill="x")
+                grid.columnconfigure((0, 1), weight=1, uniform="general")
+            cell = tk.Frame(grid, bg=PANEL)
+            cell.grid(row=i % 3, column=i // 3, sticky="nsew", padx=(0, 24))
+            tk.Label(cell, text=label, font=(FONT, 10, "bold"), fg=MUTED, bg=PANEL, anchor="w", justify="left",
+                     wraplength=self.app.S(520)).pack(fill="x", pady=(0 if i % 3 == 0 else 12, 4))
+            entry = number_box(tk.Entry(cell, width=8, **entry_opts()), "number")
             entry.insert(0, str(value))
             entry.pack(anchor="w", ipady=5)
             self.general_entries[key] = entry
@@ -1726,6 +2671,12 @@ class SettingsWindow(Dialog):
                        variable=self.fullscreen_var, font=(FONT, 11), fg=TEXT, bg=PANEL, selectcolor=PANEL_2,
                        activebackground=PANEL, activeforeground=TEXT, anchor="w", bd=0,
                        highlightthickness=0).pack(fill="x", pady=(14, 0))
+        self.touch_var = tk.BooleanVar(value=bool(cfg.get("touch", False)))
+        tk.Checkbutton(p, text="Touch screen (on-screen keyboard, number pad for PINs, bigger buttons, "
+                               "no hover effects). The mouse and keyboard still work",
+                       variable=self.touch_var, font=(FONT, 11), fg=TEXT, bg=PANEL, selectcolor=PANEL_2,
+                       activebackground=PANEL, activeforeground=TEXT, anchor="w", bd=0,
+                       highlightthickness=0).pack(fill="x", pady=(8, 0))
         row = tk.Frame(p, bg=PANEL)
         row.pack(fill="x", pady=(12, 0))
         tk.Label(row, text="Colours:", font=(FONT, 11), fg=TEXT, bg=PANEL).pack(side="left", padx=(0, 10))
@@ -1753,15 +2704,21 @@ class SettingsWindow(Dialog):
         cfg["low_stock_dryer"] = values["low_dry"]
         cfg["bank_limit_rent"] = values["bank_rent"]
         cfg["bank_limit_drawer"] = values["bank_drawer"]
+        cfg["max_float"] = values["max_float"]
         cfg["fullscreen"] = self.fullscreen_var.get()
         new_theme = self.theme_var.get() != cfg.get("theme", "dark")
         cfg["theme"] = self.theme_var.get()
+        new_touch = self.touch_var.get() != bool(cfg.get("touch", False))
+        cfg["touch"] = self.touch_var.get()
+        apply_touch(cfg["touch"])  # keyboard, number pad and hover change now; button sizes on restart
         self.app.save_cfg()
         self.app.apply_fullscreen()
         self.lift()  # keep Settings in front of the main window after it changes size
         self.app.refresh_stats()
-        if new_theme:
-            if messagebox.askyesno("General", "Saved. The new colours need the app to restart.\n\n"
+        if new_theme or new_touch:
+            what = ("The new colours need the app to restart." if new_theme
+                    else "The touch screen button sizes change when the app restarts.")
+            if messagebox.askyesno("General", f"Saved. {what}\n\n"
                                    "Restart now? (Nothing is lost: everything is already saved.)", parent=self):
                 self.app.restart_app()
             return
@@ -1771,11 +2728,11 @@ class SettingsWindow(Dialog):
     def _build_prices(self, p):
         cfg = self.app.cfg
         self._label(p, "Washing token price (£)", top=0)
-        self.wash_price = tk.Entry(p, width=12, **entry_opts())
+        self.wash_price = number_box(tk.Entry(p, width=12, **entry_opts()))
         self.wash_price.insert(0, csv_money(cfg["price_washing_pence"]))
         self.wash_price.pack(anchor="w", ipady=5)
         self._label(p, "Dryer token price (£)")
-        self.dry_price = tk.Entry(p, width=12, **entry_opts())
+        self.dry_price = number_box(tk.Entry(p, width=12, **entry_opts()))
         self.dry_price.insert(0, csv_money(cfg["price_dryer_pence"]))
         self.dry_price.pack(anchor="w", ipady=5)
         HoverButton(p, text="Save prices", bg=TEAL, hover=TEAL_HOVER,
@@ -2054,7 +3011,7 @@ class SettingsWindow(Dialog):
 
 class DrawerView(tk.Frame):
     """The laundry-token cash drawer: what should be in it now, and everything that moved cash in
-    or out since it was last emptied. Opening it (no sale / change), counting it, petty cash and
+    or out since it was last banked. Opening it (no sale / change), counting it, petty cash and
     banking are all done here. Rent money never goes in the drawer."""
 
     def __init__(self, master, app):
@@ -2080,8 +3037,9 @@ class DrawerView(tk.Frame):
         tk.Frame(p, bg=BORDER, height=1).pack(fill="x", pady=S(14))
         self.lines = {}
         for key, label in (("takings", "Token takings"), ("petty", "Petty cash taken out"),
+                           ("open_petty", "Petty cash waiting for a receipt"),
                            ("counts", "Count corrections"), ("last_count", "Last counted"),
-                           ("last_banked", "Last emptied for banking")):
+                           ("last_banked", "Last banked")):
             row = tk.Frame(p, bg=PANEL)
             row.pack(fill="x", pady=3)
             tk.Label(row, text=label, font=(FONT, 11), fg=MUTED, bg=PANEL).pack(side="left")
@@ -2096,11 +3054,23 @@ class DrawerView(tk.Frame):
                  AMBER, AMBER_HOVER, app.no_sale),
                 ("Count cash", "count it (e.g. end of day); any difference is recorded", None, None,
                  app.count_cash),
-                ("Petty cash", "cash taken out for an office expense", None, None, app.petty_cash),
+                ("Petty cash", "take cash for an expense, then hand in the receipt and any change", None, None,
+                 app.petty_cash),
                 ("Bank takings", "empty the drawer and take the cash to the bank", GREEN, GREEN_HOVER,
                  app.bank_takings)):
-            HoverButton(actions, text=text, bg=bg, hover=hover, fg="#ffffff" if bg else None,
-                        font=(FONT, 12, "bold"), pady=10, command=command).pack(fill="x", pady=(S(10), 0))
+            if command == app.petty_cash:  # petty cash shares its row with handing in the receipt
+                row = tk.Frame(actions, bg=PANEL)
+                row.pack(fill="x", pady=(S(10), 0))
+                row.columnconfigure((0, 1), weight=1, uniform="petty")
+                HoverButton(row, text=text, font=(FONT, 12, "bold"), pady=10,
+                            command=command).grid(row=0, column=0, sticky="ew", padx=(0, S(4)))
+                self.receipt_button = HoverButton(row, text="Hand in receipt", bg=PURPLE, hover=PURPLE_HOVER,
+                                                  fg="#ffffff", font=(FONT, 12, "bold"), pady=10,
+                                                  command=app.settle_petty)
+                self.receipt_button.grid(row=0, column=1, sticky="ew", padx=(S(4), 0))
+            else:
+                HoverButton(actions, text=text, bg=bg, hover=hover, fg="#ffffff" if bg else None,
+                            font=(FONT, 12, "bold"), pady=10, command=command).pack(fill="x", pady=(S(10), 0))
             tk.Label(actions, text=sub, font=(FONT, 9), fg=DIM, bg=PANEL, anchor="w").pack(fill="x")
 
         main = tk.Frame(self, bg=BG)
@@ -2112,33 +3082,18 @@ class DrawerView(tk.Frame):
         tk.Label(bar, text="Cash in and out", font=(FONT, 14, "bold"), fg=TEXT, bg=BG).pack(side="left",
                                                                                           padx=(0, 16))
         self.filter_buttons = {}
-        for key, text in (("since", "Since last emptied"), ("all", "Everything")):
+        for key, text in (("since", "Since last banked"), ("all", "Everything")):
             btn = HoverButton(bar, text=text, font=(FONT, 9, "bold"), padx=10, pady=4,
                               command=lambda k=key: self.set_filter(k))
             btn.pack(side="left", padx=(0, 4))
             self.filter_buttons[key] = btn
+        HoverButton(bar, text="Void", bg=RED, hover=RED_HOVER, font=(FONT, 10, "bold"),
+                    command=lambda: app.void_selected(self.cards.selection())).pack(side="right")
         table = tk.Frame(main, bg=PANEL)
         table.grid(row=1, column=0, sticky="nsew")
-        columns = [("no", "#", 60, "w"), ("when", "Date & time", 140, "w"), ("type", "What", 130, "w"),
-                   ("details", "Details", 360, "w"), ("amount", "Amount", 100, "e"),
-                   ("balance", "In drawer after", 120, "e"), ("staff", "Staff", 130, "w")]
-        self.tree = ttk.Treeview(table, columns=[c[0] for c in columns], show="headings", style="Dark.Treeview",
-                                 selectmode="browse")
-        for key, text, width, anchor in columns:
-            self.tree.heading(key, text=text, anchor=anchor)
-            self.tree.column(key, width=S(width), minwidth=S(40), anchor=anchor, stretch=key == "details")
-        sb = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=sb.set)
-        self.tree.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
-        self.tree.tag_configure("tampered", background=TAMPERED_BG, foreground=TAMPERED_FG)
-        self.tree.tag_configure("even", background=ROW_A)
-        self.tree.tag_configure("odd", background=ROW_B)
-        for tag, color in (("out", PURPLE_HOVER), ("count", AMBER), ("banked", GREEN_HOVER), ("open", MUTED),
-                           ("void", RED)):
-            self.tree.tag_configure(tag, foreground=color)
-        make_sortable(self.tree)
-        self.empty = tk.Label(table, text="", font=(FONT, 11), fg=MUTED, bg=ROW_A)
+        self.cards = CardList(table, app)
+        self.cards.pack(fill="both", expand=True)
+        self.empty = tk.Label(table, text="", font=(FONT, 11), fg=MUTED, bg=PANEL)
         self.set_filter("since")
 
     def set_filter(self, key):
@@ -2157,13 +3112,18 @@ class DrawerView(tk.Frame):
         petty_refs = self.app.petty_receipts()
         takings = sum(r["total"] for r in since if r["type"] == TYPE_SALE
                       or (r["type"] == TYPE_VOID and r["ref"] not in petty_refs))
-        petty = -sum(r["total"] for r in since if r["type"] == TYPE_PETTY
+        petty = -sum(r["total"] for r in since if r["type"] in (TYPE_PETTY, TYPE_PETTY_SETTLE)
                      or (r["type"] == TYPE_VOID and r["ref"] in petty_refs))
+        waiting = open_advances(records)
+        self.lines["open_petty"].config(
+            text=f"{fmt_money(-sum(r['total'] for r in waiting))} ({len(waiting)})" if waiting else "none",
+            fg=AMBER if waiting else TEXT)
+        self.receipt_button.set_enabled(bool(waiting))
         counts = sum(r["total"] for r in since if r["type"] == TYPE_COUNT)
         self.total.config(text=fmt_money(drawer_expected(records)))
         banked = records[last] if last >= 0 else None
-        self.since.config(text=f"Since it was last emptied for banking on {banked['dt']:%d/%m/%Y}."
-                          if banked else "Since the app started (never emptied for banking yet).")
+        self.since.config(text=f"Since it was last banked on {banked['dt']:%d/%m/%Y}."
+                          if banked else "Since the app started (never banked yet).")
         self.lines["takings"].config(text=fmt_money(takings))
         self.lines["petty"].config(text=fmt_money(-petty) if petty else "£0.00")
         self.lines["counts"].config(text=(("+" if counts > 0 else "") + fmt_money(counts)) if counts else "none",
@@ -2175,33 +3135,44 @@ class DrawerView(tk.Frame):
         self._fill(records if self.filter == "all" else since, petty_refs)
 
     def _fill(self, rows, petty_refs):
-        self.tree.delete(*self.tree.get_children())
+        # what each kind of entry is called, and its colour (looked up now, so it follows the theme)
+        kinds = {TYPE_SALE: ("Token sale", GREEN), TYPE_VOID: ("Void", RED), TYPE_PETTY: ("Petty cash out", PURPLE),
+                 TYPE_PETTY_SETTLE: ("Petty cash receipt handed in", PURPLE), TYPE_NOSALE: ("Drawer opened", AMBER),
+                 TYPE_COUNT: ("Cash counted", AMBER), TYPE_BANKED: ("Banked", TEAL),
+                 TYPE_KEPT: ("Kept in the drawer", TEAL)}
+        selected = self.cards.selection()
+        self.cards.clear()
         # running balance: what the drawer held after each row (banking empties it)
         balance, shown, wanted = 0, [], {id(r) for r in rows}
+        waiting = {r["receipt"] for r in open_advances(self.app.records)}
         for r in self.app.records:
             if r["type"] in (TYPE_ACCEPTED,) + STOCK_TYPES:
                 continue  # no cash involved
             balance = 0 if r["type"] == TYPE_BANKED else balance + r["total"]
             if id(r) in wanted:
                 shown.append((r, balance))
-        for n, (r, bal) in enumerate(reversed(shown)):
-            kind = {TYPE_SALE: "Sale", TYPE_VOID: "Void", TYPE_PETTY: "Petty cash", TYPE_NOSALE: "No sale",
-                    TYPE_COUNT: "Count", TYPE_BANKED: "Banked"}.get(r["type"], r["type"].title())
+        for r, bal in reversed(shown):
+            title, color = kinds.get(r["type"], (r["type"].title(), GREY_BTN))
             if r["type"] == TYPE_SALE:
-                details = f"Flat {r['flat']} · {r['name']} · {describe_items(r['wash'], r['dry'])}"
+                detail = f"Flat {r['flat']} · {r['name']} · {describe_items(r['wash'], r['dry'])}"
+            elif r["receipt"] in waiting:
+                detail = f"{r['notes']}  ·  waiting for the receipt"
             else:
-                details = r["notes"]
-            amount = "" if r["type"] == TYPE_NOSALE else fmt_money(r["total"])
-            tag = {TYPE_PETTY: "out", TYPE_COUNT: "count", TYPE_BANKED: "banked", TYPE_NOSALE: "open",
-                   TYPE_VOID: "void"}.get(r["type"])
-            tags = ["odd" if n % 2 else "even"] + ([tag] if tag else []) + (["tampered"] if r["tampered"] else [])
-            self.tree.insert("", "end", values=(r["receipt"], r["dt"].strftime("%d/%m/%Y %H:%M"), kind, details,
-                                                amount, fmt_money(bal), r["staff"]), tags=tags)
-        self.tree.resort()
+                detail = r["notes"]
+            when = (f"#{r['receipt']}  ·  {friendly_date(r['dt'])} {r['dt']:%H:%M}  ·  {r['staff']}"
+                    f"  ·  {fmt_money(bal)} in the drawer after")
+            if r["type"] == TYPE_NOSALE:
+                badge = "No sale"
+            else:
+                badge = ("+" if r["total"] > 0 else "") + fmt_money(r["total"])
+            self.cards.add(r["receipt"], title, (detail, when), badge, color,
+                           quiet=r["type"] in (TYPE_NOSALE, TYPE_KEPT), flagged=r["tampered"])
+        self.cards.finish()
+        self.cards.selection_set([i for i in selected if self.cards.exists(i)])
         if shown:
             self.empty.place_forget()
         else:
-            self.empty.config(text="Nothing since the drawer was last emptied." if self.filter == "since"
+            self.empty.config(text="Nothing since the drawer was last banked." if self.filter == "since"
                               else "Nothing yet.")
             self.empty.place(relx=0.5, rely=0.5, anchor="center")
 
@@ -2220,6 +3191,7 @@ class App(tk.Tk):
         prepare_data_dir()
         self.cfg, config_warning = load_config()
         apply_theme(self.cfg.get("theme", "dark"))  # before any widget (or rent/keys/post) uses a colour
+        apply_touch(self.cfg.get("touch", False))
         self.scale = self.winfo_fpixels("1i") / 96
         self.title(APP_TITLE)
         self.configure(bg=BG)
@@ -2256,6 +3228,8 @@ class App(tk.Tk):
 
         self.logo_image = self._load_logo()
         self._init_styles()
+        self.keyboard = TouchKeyboard(self)
+        enable_drag_scroll(self)
         self._build_ui()
         self.apply_prices()
         self.clear_sale()
@@ -2364,7 +3338,8 @@ class App(tk.Tk):
                      borderwidth=0, font=(FONT, 10, "bold"), padding=(8, 8))
         st.map("Dark.Treeview.Heading", background=[("active", BORDER)])
         st.configure("Vertical.TScrollbar", background=PANEL_2, troughcolor=PANEL, bordercolor=PANEL,
-                     arrowcolor=MUTED, lightcolor=PANEL_2, darkcolor=PANEL_2, gripcount=0)
+                     arrowcolor=MUTED, lightcolor=PANEL_2, darkcolor=PANEL_2, gripcount=0,
+                     arrowsize=self.S(20))  # wide enough to grab with a finger
         st.map("Vertical.TScrollbar", background=[("active", GREY_HOVER)])
         st.configure("TNotebook", background=PANEL, borderwidth=0, tabmargins=0,
                      bordercolor=BORDER, lightcolor=PANEL, darkcolor=PANEL)
@@ -2374,13 +3349,14 @@ class App(tk.Tk):
                lightcolor=[("selected", TEAL)])
         st.configure("TCombobox", fieldbackground=PANEL_2, background=PANEL_2, foreground=TEXT,
                      arrowcolor=TEXT, bordercolor=BORDER, lightcolor=PANEL_2, darkcolor=PANEL_2,
-                     selectbackground=PANEL_2, selectforeground=TEXT, insertcolor=TEXT)
+                     selectbackground=PANEL_2, selectforeground=TEXT, insertcolor=TEXT,
+                     arrowsize=self.S(20), padding=(6, 4))
         st.map("TCombobox", fieldbackground=[("readonly", PANEL_2)], foreground=[("readonly", TEXT)],
                background=[("active", GREY_HOVER)])
         self.option_add("*TCombobox*Listbox.background", PANEL_2)
         self.option_add("*TCombobox*Listbox.foreground", TEXT)
         self.option_add("*TCombobox*Listbox.selectBackground", TEAL)
-        self.option_add("*TCombobox*Listbox.font", (FONT, 11))
+        self.option_add("*TCombobox*Listbox.font", (FONT, 13))  # taller rows to tap in the drop-down
 
     def _build_ui(self):
         self.columnconfigure(0, weight=1)
@@ -2778,34 +3754,12 @@ class App(tk.Tk):
 
         table = tk.Frame(main, bg=PANEL)
         table.grid(row=3, column=0, sticky="nsew")
-        columns = [("receipt", "#", 60, "w"), ("datetime", "Date & time", 140, "w"), ("type", "Type", 110, "w"),
-                   ("flat", "Flat", 60, "w"), ("tenant", "Tenant", 180, "w"), ("wash", "Washing", 80, "e"),
-                   ("dry", "Dryer", 70, "e"), ("total", "Total", 90, "e"), ("staff", "Staff", 110, "w"),
-                   ("notes", "Notes", 220, "w")]
-        self.tree = ttk.Treeview(table, columns=[c[0] for c in columns], show="headings",
-                                 style="Dark.Treeview", selectmode="browse")
-        for key, text, width, anchor in columns:
-            self.tree.heading(key, text=text, anchor=anchor)
-            self.tree.column(key, width=self.S(width), minwidth=self.S(40), anchor=anchor,
-                             stretch=key in ("tenant", "notes"))
-        sb = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=sb.set)
-        self.tree.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
-        self.tree.tag_configure("tampered", background=TAMPERED_BG, foreground=TAMPERED_FG)  # first = wins
-        self.tree.tag_configure("even", background=ROW_A)
-        self.tree.tag_configure("odd", background=ROW_B)
-        self.tree.tag_configure("void", foreground=RED)
-        self.tree.tag_configure("nosale", foreground=YELLOW)
-        self.tree.tag_configure("petty", foreground=PURPLE_HOVER)
-        self.tree.tag_configure("accepted", foreground=TAMPERED_FG)
-        self.tree.tag_configure("stock", foreground=TEAL)
-        self.tree.tag_configure("banked", foreground=GREEN_HOVER)
-        self.tree.tag_configure("count", foreground=AMBER)
-        make_sortable(self.tree)
-        self.tree.tag_configure("voided", foreground=DIM, font=(FONT, 10, "overstrike"))
-        self.empty_label = tk.Label(table, text="No transactions yet. Sales will appear here.",
-                                    font=(FONT, 11), fg=MUTED, bg=ROW_A)
+        # laundry only: sales, their voids and token stock. Everything else that moves cash
+        # (no sale, petty cash, counts, banking) is on the Drawer screen.
+        self.log = CardList(table, self)
+        self.log.pack(fill="both", expand=True)
+        self.empty_label = tk.Label(table, text="No sales yet. Token sales will appear here.",
+                                    font=(FONT, 11), fg=MUTED, bg=PANEL)
 
     def _build_statusbar(self):
         bar = tk.Frame(self, bg=STATUS_BG)
@@ -2839,6 +3793,10 @@ class App(tk.Tk):
         """Whole pounds above which Home highlights money waiting to be banked (0 = never)."""
         default = DEFAULT_BANK_LIMITS[which]
         return parse_int(self.cfg.get(f"bank_limit_{which}", default), default)
+
+    def max_float(self):
+        """Pence staff may leave in the drawer when banking (Settings → General, whole £)."""
+        return parse_int(self.cfg.get("max_float", DEFAULT_MAX_FLOAT), DEFAULT_MAX_FLOAT) * 100
 
     def low_stock_levels(self):
         return {"wash": parse_int(self.cfg.get("low_stock_washing", DEFAULT_LOW_STOCK), DEFAULT_LOW_STOCK),
@@ -2966,7 +3924,7 @@ class App(tk.Tk):
         return {r["ref"] for r in self.records if r["type"] == TYPE_VOID and r["ref"] is not None}
 
     def petty_receipts(self):
-        return {r["receipt"] for r in self.records if r["type"] == TYPE_PETTY}
+        return {r["receipt"] for r in self.records if r["type"] in (TYPE_PETTY, TYPE_PETTY_SETTLE)}
 
     def next_receipt(self):
         return (self.records[-1]["receipt"] + 1) if self.records else 1
@@ -3050,6 +4008,8 @@ class App(tk.Tk):
         self.update_total()
 
     def _show_tenant(self, flat, hover=False):
+        if hover and TOUCH:  # a tap "hovers" too and never leaves: show only the flat actually picked
+            return
         if not hover:  # the link belongs to the selected flat, not the one under the mouse
             if flat:
                 self.history_link.pack(side="right", before=self.tenant_label)
@@ -3129,6 +4089,11 @@ class App(tk.Tk):
         wash, dry = self.wash_stepper.qty, self.dry_stepper.qty
         if not self.selected_flat or wash + dry == 0:
             return
+        short = self.stock_shortfall(wash, dry)
+        if short:
+            messagebox.showwarning("Not enough tokens", short, parent=self)
+            self.refresh_all()
+            return
         flat, name = self.selected_flat, self.tenant_name(self.selected_flat)
         total = self.current_total()
         dlg = PinDialog(self, self, "Confirm sale", f"Take {fmt_money(total)}",
@@ -3141,6 +4106,12 @@ class App(tk.Tk):
                 self.set_message("Sale cancelled")
             return
         staff, _ = result
+        short = self.stock_shortfall(wash, dry)  # checked again: stock may have changed while the PIN was typed
+        if short:
+            messagebox.showwarning("Not enough tokens", short + "\n\nNothing was recorded and the drawer was not opened.",
+                                   parent=self)
+            self.refresh_all()
+            return
         change = dlg.change_pence
         notes = f"Cash given {fmt_money(dlg.given_pence)}, change {fmt_money(change)}" if change is not None else ""
         rec = self.record_event(TYPE_SALE, flat, name, wash, dry, total, staff["name"], notes=notes)
@@ -3152,22 +4123,55 @@ class App(tk.Tk):
                          + (f"  ·  GIVE {fmt_money(change)} CHANGE" if change else "")
                          + ("" if ok else "  (drawer did not open)"), GREEN if ok else YELLOW)
 
-    def void_selected(self):
-        sel = self.tree.selection()
+    def stock_shortfall(self, wash, dry):
+        """Why this sale is for more tokens than the office has, or "" when there are enough."""
+        stock = token_stock(self.records)
+        if stock is None:
+            return ""
+        lines = [f"{label}: selling {want}, only {max(0, have)} in stock."
+                 for label, want, have in (("Washing tokens", wash, stock["wash"]), ("Dryer tokens", dry, stock["dry"]))
+                 if want > have]
+        if not lines:
+            return ""
+        return ("\n".join(lines) + "\n\nIf there are more tokens in the office than the app thinks, record them "
+                "under Token stock (Tokens received, or Stock count) first.")
+
+    def void_selected(self, sel=None):
+        """Voids the sale selected in the laundry log, or (from the Drawer screen) the sale or
+        petty cash selected there."""
+        if sel is None:
+            sel = self.log.selection()
+            if not sel:
+                messagebox.showinfo("Void", "Select the sale you want to void in the log first. Petty cash "
+                                    "is voided on the Drawer screen.", parent=self)
+                return
         if not sel:
-            messagebox.showinfo("Void", "Select the sale or petty cash entry you want to void in the log first.",
-                                parent=self)
+            messagebox.showinfo("Void", "Select the sale or petty cash entry you want to void first.", parent=self)
             return
         receipt = int(sel[0].split("-")[0])
         rec = next((r for r in self.records if r["receipt"] == receipt), None)
-        if rec is None or rec["type"] not in (TYPE_SALE, TYPE_PETTY):
+        if rec is None or rec["type"] not in (TYPE_SALE, TYPE_PETTY, TYPE_PETTY_SETTLE):
             messagebox.showinfo("Void", "Only sales and petty cash can be voided.", parent=self)
             return
         if receipt in self.voided_receipts():
             messagebox.showinfo("Void", f"#{receipt} has already been voided.", parent=self)
             return
-        is_petty = rec["type"] == TYPE_PETTY
-        if is_petty:
+        settled = petty_advances(self.records).get(receipt, {}).get("settled")
+        if settled:
+            messagebox.showinfo("Void", f"The receipt for petty cash #{receipt} has been handed in (#{settled['receipt']}). "
+                                f"Void #{settled['receipt']} first, then this.", parent=self)
+            return
+        is_petty = rec["type"] in (TYPE_PETTY, TYPE_PETTY_SETTLE)
+        if rec["type"] == TYPE_PETTY_SETTLE:
+            back = rec["total"]
+            heading, lines = f"Void petty cash receipt #{receipt}", [
+                rec["notes"],
+                f"Handed in by {rec['staff']} on {rec['dt']:%d/%m/%Y %H:%M}",
+                (f"Take {fmt_money(back)} back out of the drawer." if back > 0 else
+                 f"Put {fmt_money(-back)} back in the drawer." if back < 0 else "No cash moves.")
+                + f" Petty cash #{rec['ref']} will be waiting for its receipt again."]
+            confirm_text, notes = "Void & open drawer", f"Voids petty cash receipt #{receipt}: "
+        elif is_petty:
             amount = fmt_money(-rec["total"])
             heading, lines = f"Void petty cash #{receipt}", [
                 f"Petty cash {amount}  ·  {rec['notes']}",
@@ -3178,8 +4182,9 @@ class App(tk.Tk):
             heading, lines = f"Void sale #{receipt}", [
                 f"Flat {rec['flat']}  ·  {rec['name'] or '(no name)'}",
                 f"{describe_items(rec['wash'], rec['dry'])} on {rec['dt']:%d/%m/%Y %H:%M}",
-                f"Refund {fmt_money(rec['total'])} to the tenant. The drawer will open."]
-            confirm_text, notes = "Void & refund", f"Voids #{receipt}: "
+                f"The drawer total goes down by {fmt_money(rec['total'])}. The drawer will not open: "
+                "if the tenant needs the cash back, use Open drawer · no sale."]
+            confirm_text, notes = "Void sale", f"Voids #{receipt}: "
         dlg = PinDialog(self, self, "Void", heading, lines, admin_only=True, reason_label="Reason",
                         confirm_text=confirm_text, confirm_bg=RED, confirm_hover=RED_HOVER)
         result = dlg.show()
@@ -3191,18 +4196,23 @@ class App(tk.Tk):
                                  staff["name"], ref=receipt, notes=notes + reason)
         if void is None:
             return
+        if not is_petty:  # a voided sale doesn't open the drawer
+            self.set_message(f"Sale #{receipt} voided ({fmt_money(rec['total'])})", YELLOW)
+            return
         ok = self._open_drawer_after(void, "void")
-        if is_petty:
-            msg = f"Petty cash #{receipt} voided. Put {fmt_money(-rec['total'])} back in the drawer"
+        if rec["type"] == TYPE_PETTY_SETTLE:
+            msg = f"Petty cash receipt #{receipt} voided. " + (
+                f"Take {fmt_money(rec['total'])} out of the drawer" if rec["total"] > 0 else
+                f"Put {fmt_money(-rec['total'])} back in the drawer" if rec["total"] < 0 else "No cash moves")
         else:
-            msg = f"Sale #{receipt} voided. Refund {fmt_money(rec['total'])}"
+            msg = f"Petty cash #{receipt} voided. Put {fmt_money(-rec['total'])} back in the drawer"
         self.set_message(msg + ("" if ok else "  (drawer did not open)"), YELLOW)
 
     def petty_cash(self):
         dlg = PinDialog(self, self, "Petty cash", "Take petty cash",
                         ["Takes cash out of the drawer for an expense.",
                          "Recorded in the log with the amount, what it was for and your name. "
-                         "Keep the shop receipt."],
+                         "When you're back, press Hand in receipt and put any change back."],
                         amount_label="Amount (£)", reason_label="What is it for? (e.g. cleaning supplies)",
                         confirm_text="Take cash & open drawer", confirm_bg=PURPLE, confirm_hover=PURPLE_HOVER)
         result = dlg.show()
@@ -3217,6 +4227,63 @@ class App(tk.Tk):
         ok = self._open_drawer_after(rec, "petty cash")
         self.set_message(f"Petty cash #{rec['receipt']}: {fmt_money(amount)} taken by {staff['name']} for {reason}"
                          + ("" if ok else "  (drawer did not open)"), PURPLE_HOVER if ok else YELLOW)
+
+    def settle_petty(self):
+        """Hand in the receipt for petty cash taken earlier: what was spent is recorded, and any
+        change goes back in the drawer (or, if more was spent, the difference is paid out)."""
+        waiting = open_advances(self.records)
+        if not waiting:
+            messagebox.showinfo("Hand in receipt", "No petty cash is waiting for a receipt.", parent=self)
+            return
+        rec = waiting[0] if len(waiting) == 1 else PettyPickDialog(self, waiting).show()
+        if rec is None:
+            return
+        taken = -rec["total"]
+        receipts = ReceiptsDialog(self, rec).show()
+        if not receipts:
+            return
+        spent = sum(r["pence"] for r in receipts)
+        back = taken - spent
+        listing = ", ".join(f"{r['shop']} {fmt_money(r['pence'])}" for r in receipts)
+        todo = (f"Put {fmt_money(back)} change back in the drawer. The drawer will open." if back > 0 else
+                f"{fmt_money(-back)} more than was taken: pay it from the drawer to {rec['staff']}. "
+                "The drawer will open." if back < 0 else "No change.")
+        dlg = PinDialog(self, self, "Hand in receipt", f"Spent {fmt_money(spent)}",
+                        [f"Petty cash #{rec['receipt']}: {fmt_money(taken)} taken for {rec['notes']}",
+                         f"{len(receipts)} receipt{'s' if len(receipts) != 1 else ''}: {listing}", todo],
+                        confirm_text="Hand in & open drawer" if back else "Hand in",
+                        confirm_bg=PURPLE, confirm_hover=PURPLE_HOVER)
+        result = dlg.show()
+        if not result:
+            self._pin_locked_out(dlg)
+            return
+        staff = result[0]
+        photos = [r["photo"] for r in receipts if r["photo"] is not None]
+        outcome = (f"change {fmt_money(back)} back in the drawer" if back > 0 else
+                   f"{fmt_money(-back)} paid out to {rec['staff']}" if back < 0 else "no change")
+        settle = self.record_event(TYPE_PETTY_SETTLE, "", "", 0, 0, back, staff["name"], ref=rec["receipt"],
+                                   notes=f"Receipts for petty cash #{rec['receipt']} ({rec['notes']}): {listing}; "
+                                         f"spent {fmt_money(spent)}, {outcome}"
+                                         + (f" · {len(photos)} photo{'s' if len(photos) != 1 else ''}"
+                                            if photos else ""))
+        if settle is None:
+            return
+        try:
+            for n, photo in enumerate(photos, 1):
+                path = petty_photo_path(settle, n)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                photo.save(path, "JPEG", quality=85)
+        except OSError as e:
+            messagebox.showwarning("Receipt photos", f"The receipts WERE handed in, but the photos could not be "
+                                   f"saved:\n\n{e}\n\nKeep the paper receipts.", parent=self)
+        if back == 0:
+            self.set_message(f"✓ Petty cash #{rec['receipt']}: receipt for {fmt_money(spent)} handed in, no change",
+                             GREEN)
+            return
+        ok = self._open_drawer_after(settle, "receipt")
+        todo = f"PUT {fmt_money(back)} BACK IN THE DRAWER" if back > 0 else f"PAY {fmt_money(-back)} TO {rec['staff']}"
+        self.set_message(f"✓ Petty cash #{rec['receipt']}: spent {fmt_money(spent)}  ·  {todo}"
+                         + ("" if ok else "  (drawer did not open)"), GREEN if ok else YELLOW)
 
     def no_sale(self, reason=""):
         """Opens the drawer without a sale, e.g. to give change for a rent payment: a note goes in
@@ -3257,7 +4324,7 @@ class App(tk.Tk):
             return
         self._open_drawer_after(opened, "drawer opening")
         res = FieldsDialog(self, "Count cash", "How much cash is in the drawer?", [
-            {"key": "counted", "label": "Cash counted (£)"},
+            {"key": "counted", "label": "Cash counted (£)", "kind": "money"},
             {"key": "note", "label": "Note (needed if it doesn't match), e.g. end of day"},
         ], validate=lambda v: "Enter the cash counted, e.g. 45.50." if not v["counted"] or
             parse_pence(v["counted"]) is None or parse_pence(v["counted"]) < 0 else
@@ -3279,55 +4346,96 @@ class App(tk.Tk):
                          YELLOW if diff else GREEN)
 
     def bank_takings(self):
-        """Empty the drawer and take the cash to the bank (token takings account)."""
+        """Count the drawer and take cash to the bank (token takings account). Staff may bank only
+        part of it and leave the rest in the drawer as a float (KEPT IN DRAWER row)."""
         expected = drawer_expected(self.records)
-        last = next((r for r in reversed(self.records) if r["type"] == TYPE_BANKED), None)
-        since = f"since it was last emptied on {last['dt']:%d/%m/%Y}" if last else "so far"
-        dlg = PinDialog(self, self, "Bank takings", "Empty the drawer for banking",
+        waiting = open_advances(self.records)
+        max_float = self.max_float()
+        dlg = PinDialog(self, self, "Bank takings", "Bank takings",
                         [f"Should be in the drawer: {fmt_money(expected)}",
-                         f"Token takings minus petty cash {since}.",
-                         "The drawer opens. Take out ALL the cash and count it."],
+                         "The drawer will open. Count all the cash."]
+                        + ([f"{len(waiting)} petty cash still waiting for a receipt."] if waiting else []),
                         confirm_text="Open drawer", confirm_bg=TEAL, confirm_hover=TEAL_HOVER)
         result = dlg.show()
         if not result:
             self._pin_locked_out(dlg)
             return
         staff = result[0]
-        opened = self.record_event(TYPE_NOSALE, "", "", 0, 0, 0, staff["name"], notes="Emptied for banking")
+        opened = self.record_event(TYPE_NOSALE, "", "", 0, 0, 0, staff["name"], notes="Opened for banking")
         if opened is None:
             return
         self._open_drawer_after(opened, "drawer opening")
 
         def validate(v):
-            paid = parse_pence(v["paid"])
-            if paid is None or paid < 0 or not v["paid"]:
-                return "Enter the cash counted, e.g. 45.50 (0 if the drawer was empty)."
+            counted = parse_pence(v["counted"])
+            if counted is None or counted < 0 or not v["counted"]:
+                return "Enter the cash in the drawer, e.g. 200.00"
+            paid = counted if not v["paid"] else parse_pence(v["paid"])
+            if paid is None or paid < 0 or paid > counted:
+                return "Enter the amount to bank, e.g. 150.00"
+            if counted - paid > max_float:
+                return (f"Bank at least {fmt_money(counted - max_float)}." if max_float else
+                        "Bank all the cash. Leave the amount to bank empty.")
             return None
 
-        res = FieldsDialog(self, "Bank takings", "How much cash was in the drawer?", [
-            {"key": "paid", "label": "Cash counted and taken out for banking (£)"},
-            {"key": "slip", "label": "Paying-in slip reference (optional)"},
+        res = FieldsDialog(self, "Bank takings", "Bank takings", [
+            {"key": "counted", "label": "Cash in the drawer (£)", "kind": "money"},
+            {"key": "paid", "label": "Amount to bank (£), empty = all", "kind": "money"},
+            {"key": "slip", "label": "Paying-in slip ref (optional)"},
         ], validate=validate, confirm_text="Record banking",
-            sub=f"The app expects {fmt_money(expected)}. Enter what you actually counted.").show()
+            sub=f"You can leave up to {fmt_money(max_float)} in the drawer." if max_float else None).show()
         if not res:
             self.set_message("Banking cancelled. Put the cash back in the drawer", YELLOW)
             return
-        paid = parse_pence(res["paid"])
-        diff = paid - expected
+        counted = parse_pence(res["counted"])
+        paid = counted if not res["paid"] else parse_pence(res["paid"])
+        kept = counted - paid
+        diff = counted - expected
         if diff and not messagebox.askyesno(
-                "Bank takings", f"You counted {fmt_money(paid)} but the drawer should have had {fmt_money(expected)}: "
-                f"{'over' if diff > 0 else 'short'} by {fmt_money(abs(diff))}.\n\nCount again if you're not sure. "
-                f"Record {fmt_money(paid)} as banked, with the difference noted under your name?", parent=self):
+                "Bank takings", f"You counted {fmt_money(counted)}, it should be {fmt_money(expected)} "
+                f"({'over' if diff > 0 else 'short'} {fmt_money(abs(diff))}).\n\n"
+                "Count again if you're not sure. Record it under your name?", parent=self):
             self.set_message("Banking not recorded. Count again, then press Bank takings", YELLOW)
             return
-        rec = self.record_event(TYPE_BANKED, "", "", 0, 0, -paid, staff["name"],
-                                notes=banking_note(res["slip"], expected, paid))
+        rec = self.record_banking(paid, kept, staff["name"], banking_note(res["slip"], expected, counted, paid))
         if rec is None:
             return
-        self.set_message(f"✓ {fmt_money(paid)} taken out for banking by {staff['name']}"
+        self.set_message(f"✓ {fmt_money(paid)} banked" + (f", {fmt_money(kept)} left in the drawer" if kept else "")
                          + (f"  ({'over' if diff > 0 else 'short'} {fmt_money(abs(diff))})" if diff else ""),
                          YELLOW if diff else GREEN)
         self.print_token_banking(rec["receipt"])
+
+    def record_banking(self, paid, kept, staff_name, notes):
+        """The BANKED row and, if cash was left in the drawer, its KEPT IN DRAWER row, written in
+        one go so the drawer figure is never left at £0 by a half-saved banking.
+        Returns the BANKED record, or None if nothing could be saved."""
+        now = datetime.now().replace(microsecond=0)
+        n = self.next_receipt()
+        recs = [{"receipt": n, "dt": now, "type": TYPE_BANKED, "flat": "", "name": "", "wash": 0, "dry": 0,
+                 "total": -paid, "staff": staff_name, "ref": None, "notes": notes, "tampered": False}]
+        if kept:
+            recs.append({"receipt": n + 1, "dt": now, "type": TYPE_KEPT, "flat": "", "name": "", "wash": 0,
+                         "dry": 0, "total": kept, "staff": staff_name, "ref": n,
+                         "notes": f"Left in the drawer at banking T{n}", "tampered": False})
+        check = self.last_check
+        for r in recs:
+            r["check"] = check = row_check(check, r)
+        try:
+            append_csv_rows(SALES_PATH, SALES_HEADERS, [record_to_row(r) for r in recs])
+        except PermissionError:
+            messagebox.showerror(
+                "Could not save", "sales_log.csv is open in another program (probably Excel).\n\n"
+                "Close it and try again. The banking was NOT recorded.", parent=self)
+            return None
+        except OSError as e:
+            messagebox.showerror("Could not save", f"Could not write to sales_log.csv:\n\n{e}\n\n"
+                                 "The banking was NOT recorded.", parent=self)
+            return None
+        self.last_check = check
+        self.records.extend(recs)
+        self._set_log_tip()
+        self.refresh_all()
+        return recs[0]
 
     def print_token_banking(self, receipt, keep=True, parent=None):
         """Opens the banking sheet for the banking in log row `receipt`. keep: save it in banking/."""
@@ -3397,54 +4505,55 @@ class App(tk.Tk):
             self.drawer_view.refresh()
 
     def refresh_tree(self):
+        """The laundry log: token sales, their voids and token stock, newest first."""
         query = self.log_search.value().lower()
         voided = self.voided_receipts()
-        selected = self.tree.selection()
-        self.tree.delete(*self.tree.get_children())
-        shown = 0
+        petty = self.petty_receipts()
+        selected = self.log.selection()
+        self.log.clear()
+        seen = set()
         for rec in reversed(self.records):
-            is_voided = rec["type"] in (TYPE_SALE, TYPE_PETTY) and rec["receipt"] in voided
-            rtype = f"{rec['type']} (voided)" if is_voided else rec["type"]
-            if rec["tampered"]:
-                rtype = "⚠ " + rtype
-            is_money = rec["type"] not in (TYPE_NOSALE, TYPE_ACCEPTED) + STOCK_TYPES
-            has_tokens = rec["type"] in (TYPE_SALE,) + STOCK_TYPES or rec["wash"] or rec["dry"]
-            values = (rec["receipt"], rec["dt"].strftime("%d/%m/%Y %H:%M"), rtype, rec["flat"], rec["name"],
-                      rec["wash"] if has_tokens else "", rec["dry"] if has_tokens else "",
-                      fmt_money(rec["total"]) if is_money else "", rec["staff"], rec["notes"])
-            if query and not any(query in str(v).lower() for v in values):
+            kind = rec["type"]
+            if kind not in (TYPE_SALE, TYPE_VOID, TYPE_ACCEPTED) + STOCK_TYPES or (
+                    kind == TYPE_VOID and rec["ref"] in petty):
                 continue
-            tags = ["odd" if shown % 2 else "even"]
-            if rec["tampered"]:
-                tags.append("tampered")
-            elif rec["type"] == TYPE_VOID:
-                tags.append("void")
-            elif rec["type"] == TYPE_NOSALE:
-                tags.append("nosale")
-            elif rec["type"] == TYPE_COUNT:
-                tags.append("count")
-            elif rec["type"] == TYPE_ACCEPTED:
-                tags.append("accepted")
-            elif rec["type"] in STOCK_TYPES:
-                tags.append("stock")
-            elif rec["type"] == TYPE_BANKED:
-                tags.append("banked")
-            elif is_voided:
-                tags.append("voided")
-            elif rec["type"] == TYPE_PETTY:
-                tags.append("petty")
+            when = f"#{rec['receipt']}  ·  {friendly_date(rec['dt'])} {rec['dt']:%H:%M}  ·  {rec['staff']}"
+            faded = quiet = False
+            if kind == TYPE_SALE:
+                title = f"Flat {rec['flat']}  ·  {rec['name']}" if rec["flat"] else "Sale"
+                detail = describe_items(rec["wash"], rec["dry"])
+                if rec["receipt"] in voided:
+                    badge, color, faded, quiet = "Voided", DIM, True, True
+                else:
+                    badge, color = fmt_money(rec["total"]), GREEN
+            elif kind == TYPE_VOID:
+                title = f"Void of sale #{rec['ref']}" if rec["ref"] is not None else "Void"
+                detail = ""
+                badge, color = fmt_money(rec["total"]), RED
+            elif kind == TYPE_STOCK_IN:
+                title, detail = "Tokens delivered", describe_items(rec["wash"], rec["dry"])
+                badge, color, quiet = "Stock in", TEAL, True
+            elif kind == TYPE_STOCK_COUNT:
+                diffs = [f"{n} {'+' if q > 0 else ''}{q}" for n, q in (("washing", rec["wash"]), ("dryer", rec["dry"]))
+                         if q]
+                title = "Tokens counted"
+                detail = ("Difference: " + ", ".join(diffs)) if diffs else "Matched what was expected"
+                badge, color, quiet = "Stock count", AMBER, True
+            else:
+                title, detail, badge, color = "Log accepted by an admin", "", "Accepted", TAMPERED_FG
+            lines = [" · ".join(x for x in (detail, rec["notes"]) if x), when]
+            if query and not any(query in str(v).lower() for v in (title, *lines, badge, kind)):
+                continue
             iid = str(rec["receipt"])
-            if self.tree.exists(iid):  # duplicate receipt number in a hand-edited file
-                iid = f"{rec['receipt']}-{shown}"
-            self.tree.insert("", "end", iid=iid, values=values, tags=tags)
-            shown += 1
-        self.tree.resort()
-        still_there = [iid for iid in selected if self.tree.exists(iid)]
-        if still_there:
-            self.tree.selection_set(still_there)
-        if shown == 0:
-            self.empty_label.config(text="No matching transactions." if query else
-                                    "No transactions yet. Sales will appear here.")
+            if iid in seen:  # duplicate receipt number in a hand-edited file
+                iid = f"{rec['receipt']}-{len(seen)}"
+            seen.add(iid)
+            self.log.add(iid, title, lines, badge, color, quiet=quiet, faded=faded, flagged=rec["tampered"])
+        self.log.finish()
+        self.log.selection_set([i for i in selected if self.log.exists(i)])
+        if not seen:
+            self.empty_label.config(text="No matching sales." if query else
+                                    "No sales yet. Token sales will appear here.")
             self.empty_label.place(relx=0.5, rely=0.5, anchor="center")
         else:
             self.empty_label.place_forget()

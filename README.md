@@ -48,6 +48,10 @@ Every document is a PDF made by the app, and your organisation's name and addres
   </tr>
 </table>
 
+## Made for a touch screen
+
+Turn on **Settings → General → Touch screen** and tapping a box brings up an on-screen keyboard, or a number pad for money, dates and phone numbers. Both open beside the form, not over it. The working lists are tall cards that you tap to select and drag to scroll.
+
 ## Built to be trusted with cash
 
 - **A PIN on every action.** Each sale, receipt, check, key loan and sign-out records who did it. PINs are stored as salted hashes.
@@ -60,7 +64,7 @@ Every document is a PDF made by the app, and your organisation's name and addres
 ## Running from source
 
 ```
-pip install pyserial pillow reportlab openpyxl
+pip install pyserial pillow reportlab openpyxl opencv-python-headless
 python source/front_office.py
 ```
 
@@ -73,7 +77,7 @@ pip install pyinstaller
 source\build_exe.bat
 ```
 
-This builds `Front Office.exe` as a single file in the repository root. To brand it, put a `logo.png` (and optionally an `app.ico`) in `source/` before you build.
+This builds `Front Office.exe` as a single file in the repository root. To brand it, put a `logo.png` (and optionally an `app.ico`) in `source/` before you build. To have rent receipts print straight to the default printer, also put `SumatraPDF.exe` there; without it, each receipt opens as a PDF to print by hand.
 
 ## Updating a live install
 

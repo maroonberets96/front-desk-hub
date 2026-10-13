@@ -30,7 +30,8 @@ from tkinter import filedialog, messagebox, ttk
 from front_office import (
     AMBER, BASE_DIR, BG, BORDER, DATA_DIR, DIM, FONT, GREEN, GREEN_HOVER, GREY_BTN, GREY_HOVER, MUTED, ORANGE,
     PANEL, PANEL_2, RED, RED_HOVER, ROW_A, ROW_B, TAMPERED_BG, TAMPERED_FG, TEAL, TEAL_HOVER, TEXT, UI_DATE_FMT,
-    Dialog, FieldsDialog, HoverButton, PinDialog, PlaceholderEntry, admin_save_path, entry_opts, make_sortable, natural_key, parse_int, parse_ui_date,
+    CardList, Dialog, FieldsDialog, HoverButton, PinDialog, PlaceholderEntry, admin_save_path, entry_opts, make_sortable, natural_key, number_box, parse_int, parse_ui_date,
+    friendly_date,
 )
 from logbook import ChainLog, load_list, read_sheet, save_list
 from rent import INK, SHEET_LEFT, SHEET_WIDTH, _letterhead, _sheet, _table, canvas, open_file, write_xlsx
@@ -110,7 +111,7 @@ UNIT_ONLY = re.compile(r"(flat|rm|room)\s*\w+(\s*,\s*(rm|room)\s*\w+)?(\s*\(.*\)
 def property_label(lines):
     """A readable name from the housing system's address lines:
     'Common Parts' / '12 High Street' -> '12 High Street – Common parts',
-    'Flat 1, Rm A' / 'Unity House' -> 'Flat 1, Rm A, Unity House'."""
+    'Flat 1, Rm A' / 'Example House' -> 'Flat 1, Rm A, Example House'."""
     parts = [" ".join(p.split()) for p in lines if p and p.strip()]
     parts = [p for p in parts if p.lower() != "london"]
     if not parts:
@@ -417,9 +418,14 @@ class KeyCountsDialog(Dialog):
             tk.Label(row, text=name, font=(FONT, 11), fg=TEXT, bg=PANEL_2, anchor="w").pack(side="left")
             tk.Label(row, text=f"of {qty}", font=(FONT, 10), fg=MUTED, bg=PANEL_2, width=5).pack(side="right")
             var = tk.StringVar(value=str(qty))
-            tk.Spinbox(row, from_=0, to=qty, width=3, textvariable=var, justify="center", font=(FONT, 11),
-                       state="readonly", readonlybackground=PANEL, fg=TEXT, buttonbackground=GREY_BTN,
-                       relief="flat", highlightthickness=1, highlightbackground=BORDER).pack(side="right")
+            # − 2 +: big enough to tap, where a spin box's arrows aren't
+            step = lambda d, v=var, q=qty: v.set(str(max(0, min(q, parse_int(v.get()) + d))))
+            HoverButton(row, text="+", font=(FONT, 13, "bold"), width=3, padx=0, pady=2,
+                        command=lambda s=step: s(1)).pack(side="right")
+            tk.Label(row, textvariable=var, width=3, font=(FONT, 13, "bold"), fg=TEXT,
+                     bg=PANEL_2).pack(side="right")
+            HoverButton(row, text="−", font=(FONT, 13, "bold"), width=3, padx=0, pady=2,
+                        command=lambda s=step: s(-1)).pack(side="right")
             self.spins[name] = (var, qty)
         tk.Frame(box, bg=PANEL_2, height=10).pack()
         self.person = self.note = None
@@ -494,7 +500,7 @@ class KeyView(tk.Frame):
         return link
 
     def _listbox(self, parent, rows):
-        return tk.Listbox(parent, height=rows, bg=PANEL_2, fg=TEXT, font=(FONT, 10), relief="flat",
+        return tk.Listbox(parent, height=rows, bg=PANEL_2, fg=TEXT, font=(FONT, 12), relief="flat",
                           highlightthickness=0, bd=0, selectbackground=TEAL, selectforeground="#ffffff",
                           activestyle="none", exportselection=False)
 
@@ -548,7 +554,7 @@ class KeyView(tk.Frame):
         row.columnconfigure(1, weight=2)
         self.name_entry = PlaceholderEntry(row, "Name of person collecting")
         self.name_entry.grid(row=0, column=0, sticky="ew", ipady=4, padx=(0, 6))
-        self.phone_entry = PlaceholderEntry(row, "Phone")
+        self.phone_entry = number_box(PlaceholderEntry(row, "Phone"), "phone")
         self.phone_entry.grid(row=0, column=1, sticky="ew", ipady=4)
         for e in (self.name_entry, self.phone_entry):
             e.bind("<KeyRelease>", lambda ev: self.update_form())
@@ -562,7 +568,7 @@ class KeyView(tk.Frame):
         self._section(p, "4", "Return by")
         row = tk.Frame(p, bg=PANEL)
         row.pack(fill="x")
-        self.due_entry = tk.Entry(row, width=11, justify="center", **entry_opts())
+        self.due_entry = number_box(tk.Entry(row, width=11, justify="center", **entry_opts()), "date")
         self.due_entry.pack(side="left", ipady=4)
         self.due_entry.bind("<KeyRelease>", lambda e: self.update_form())
         for text, days in (("+1 week", 7), ("Tomorrow", 1), ("Today", 0)):
@@ -782,6 +788,7 @@ class KeyView(tk.Frame):
                                      ("Lost…", GREY_BTN, GREY_HOVER, self.lost_selected),
                                      ("Reprint slip", GREY_BTN, GREY_HOVER, self.reprint_selected),
                                      ("Extend…", GREY_BTN, GREY_HOVER, self.extend_selected),
+                                     ("Details", GREY_BTN, GREY_HOVER, self.open_details),
                                      ("Return keys", GREEN, GREEN_HOVER, self.return_selected)]:
             HoverButton(bar, text=text, bg=bg, hover=hover, font=(FONT, 10, "bold"),
                         command=cmd).pack(side="right", padx=(8, 0))
@@ -791,30 +798,9 @@ class KeyView(tk.Frame):
 
         table = tk.Frame(main, bg=PANEL)
         table.grid(row=2, column=0, sticky="nsew")
-        columns = [("slip", "Slip", 70, "w"), ("date", "Issued", 90, "w"), ("property", "Property", 230, "w"),
-                   ("keys", "Keys", 190, "w"), ("contractor", "Issued to", 170, "w"), ("due", "Return by", 90, "w"),
-                   ("by", "Issued by", 100, "w"), ("status", "Status", 230, "w")]
-        self.tree = ttk.Treeview(table, columns=[c[0] for c in columns], show="headings", style="Dark.Treeview",
-                                 selectmode="browse")
-        for key, text, width, anchor in columns:
-            self.tree.heading(key, text=text, anchor=anchor)
-            self.tree.column(key, width=S(width), minwidth=S(40), anchor=anchor,
-                             stretch=key in ("property", "keys", "contractor", "status"))
-        sb = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=sb.set)
-        self.tree.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
-        self.tree.tag_configure("tampered", background=TAMPERED_BG, foreground=TAMPERED_FG)  # first = wins
-        self.tree.tag_configure("even", background=ROW_A)
-        self.tree.tag_configure("odd", background=ROW_B)
-        self.tree.tag_configure(S_OUT, foreground=TEXT)
-        self.tree.tag_configure(S_OVERDUE, foreground=RED)
-        self.tree.tag_configure(S_RETURNED, foreground=MUTED)
-        self.tree.tag_configure(S_LOST, foreground=AMBER)
-        self.tree.tag_configure(S_VOIDED, foreground=DIM, font=(FONT, 10, "overstrike"))
-        self.tree.bind("<Double-1>", lambda e: self.open_details())
-        make_sortable(self.tree)
-        self.empty_label = tk.Label(table, text="", font=(FONT, 11), fg=MUTED, bg=ROW_A)
+        self.slips = CardList(table, self.app, on_open=self.open_details)
+        self.slips.pack(fill="both", expand=True)
+        self.empty_label = tk.Label(table, text="", font=(FONT, 11), fg=MUTED, bg=PANEL)
         self.set_filter("out")
 
     def set_filter(self, key):
@@ -825,6 +811,7 @@ class KeyView(tk.Frame):
             else:
                 btn.set_colors(GREY_BTN, GREY_HOVER, TEXT)
         self.refresh_table()
+        self.slips.scroll_top()
 
     def refresh(self):
         self.refresh_cards()
@@ -860,10 +847,39 @@ class KeyView(tk.Frame):
         return (slip_name(l["slip"]), l["dt"].strftime("%d/%m/%Y"), l["property"], keys, who,
                 l["return_by"].strftime("%d/%m/%Y") if l["return_by"] else "", l["issued_by"], status_text(l))
 
+    def _add_card(self, l, status):
+        """One slip as a card: where the keys are for, then which keys and who has them, then the
+        slip, who issued it and when, with how it stands in the badge."""
+        keys = keys_display(l["keys"])
+        if l["out"] and (l["returned"] or l["lost"]):
+            keys = f"{keys_display(l['out'])} still out (of {key_count(l['keys'])})"
+        who = l["contractor"] + (f" ({l['company']})" if l["company"] else "")
+        issued = f"{slip_name(l['slip'])}  ·  issued {friendly_date(l['dt'])} by {l['issued_by']}"
+        due = l["return_by"]
+        if status == S_OVERDUE:
+            days = (date.today() - due).days
+            badge, color = f"Overdue · {plural(days, 'day')}", RED
+            issued += f"  ·  was due back {friendly_date(due)}"
+        elif status == S_OUT:
+            badge, color = (f"Due {friendly_date(due)}" if due else "Out"), TEAL
+        elif status == S_RETURNED:
+            back = last_event(l, K_RETURNED)
+            badge, color = "Returned", GREEN
+            if back:
+                issued += f"  ·  back {friendly_date(back['dt'])} to {back['Staff']}"
+        elif status == S_LOST:
+            badge, color = "Lost", AMBER
+            keys = f"Lost: {keys_display(l['lost'])}"
+        else:
+            badge, color = "Voided", DIM
+            issued += f"  ·  voided: {l['void_reason']}"
+        self.slips.add(l["slip"], l["property"], (f"{keys}  ·  {who}", issued), badge, color,
+                       quiet=status in (S_RETURNED, S_VOIDED), faded=status == S_VOIDED, flagged=l["tampered"])
+
     def refresh_table(self):
         query = self.search.value().lower()
-        selected = self.tree.selection()
-        self.tree.delete(*self.tree.get_children())
+        selected = self.slips.selection()
+        self.slips.clear()
         wanted = {"out": (S_OUT, S_OVERDUE), "overdue": (S_OVERDUE,), "returned": (S_RETURNED,), "lost": (S_LOST,),
                   "voided": (S_VOIDED,), "all": (S_OUT, S_OVERDUE, S_RETURNED, S_LOST, S_VOIDED)}[self.filter]
         shown = 0
@@ -874,13 +890,11 @@ class KeyView(tk.Frame):
             values = self._row_values(l)
             if query and not any(query in str(v).lower() for v in values + (l["phone"], l["prop_key"], l["reason"])):
                 continue
-            tags = ["odd" if shown % 2 else "even", status] + (["tampered"] if l["tampered"] else [])
-            self.tree.insert("", "end", iid=str(l["slip"]), values=values, tags=tags)
+            self._add_card(l, status)
             shown += 1
-        self.tree.resort()
-        keep = [i for i in selected if self.tree.exists(i)]
-        if keep:
-            self.tree.selection_set(keep)
+        self.slips.finish()
+        keep = [i for i in selected if self.slips.exists(i)]
+        self.slips.selection_set(keep)
         if shown:
             self.empty_label.place_forget()
         else:
@@ -891,7 +905,7 @@ class KeyView(tk.Frame):
             self.empty_label.place(relx=0.5, rely=0.5, anchor="center")
 
     def selected_loan(self, what):
-        sel = self.tree.selection()
+        sel = self.slips.selection()
         if not sel:
             messagebox.showinfo(what, "Select a slip in the list first.", parent=self.app)
             return None
@@ -1009,7 +1023,7 @@ class KeyView(tk.Frame):
 
         start = max(date.today(), loan["return_by"] or date.today()) + timedelta(days=7)
         res = FieldsDialog(self.app, "Extend", f"New return-by date · slip {name}", [
-            {"key": "date", "label": "Keys to be back by (DD/MM/YYYY)", "value": start.strftime(UI_DATE_FMT)},
+            {"key": "date", "kind": "date", "label": "Keys to be back by (DD/MM/YYYY)", "value": start.strftime(UI_DATE_FMT)},
             {"key": "why", "label": "Reason (optional), e.g. job running over"},
         ], validate=validate, confirm_text="Next",
             sub=f"{keys_display(loan['out'])} with {loan['contractor']}. Was due "
@@ -1262,7 +1276,7 @@ def build_contractors_tab(win, p):
     _list_tab(win, p, "Contractors", [("company", "Company", 280), ("name", "Person", 200), ("phone", "Phone", 160)],
               store.contractors, store.save_contractors,
               [{"key": "company", "label": "Company"}, {"key": "name", "label": "Person's name"},
-               {"key": "phone", "label": "Phone (optional)"}],
+               {"key": "phone", "label": "Phone (optional)", "kind": "phone"}],
               contractor_key, read_contractor_file,
               "Picked from when issuing keys. A company can be listed once with no person, and again for each "
               "person who collects keys; new people are added here when they first collect keys. Import reads the "

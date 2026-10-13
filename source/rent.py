@@ -11,7 +11,15 @@ Cash and cheque payments taken at the office, from receipt to bank:
   3. Banked   The payments paid in together become one deposit, with the bank date and the
               paying-in slip reference. The amount paid in must match their total.
 
-A receipt can be cancelled (with a reason) until it is banked. Its number is never reused.
+A receipt can be cancelled (with a reason) until it is banked, by an admin or checker other than
+the person who took it. Its number is never reused: the highest number issued is also kept in
+config.json, so emptying or cutting the log can't bring old numbers back, and a number missing
+from the log is flagged.
+
+Change for cash: like a token sale, "Cash given" works out the change. Only then does the token
+drawer open: the note goes in and the same amount comes out (the payment plus the change),
+recorded as a NO SALE in the token log, so the drawer total is unchanged. Exact money and
+cheques don't open it: rent cash goes with the receipt for checking, never in the drawer.
 
 Data files, in data/ next to the .exe:
   rent_log.csv      every receipt, check, banking and cancellation (append-only, with the
@@ -19,11 +27,15 @@ Data files, in data/ next to the .exe:
   rent_tenants.csv  Tenant Name, Address, Tenant Ref (the housing system's Ten Key; household
                     members share their tenancy's key)
 and receipts/YYYY/ (next to data/) holds the PDF of every receipt exactly as issued.
+A new receipt goes straight to the default printer (via the bundled SumatraPDF.exe); if
+that fails it is opened to print by hand.
 banking/YYYY/ holds the banking sheet printed for each deposit, to keep with the paying-in slip.
 """
 
 import csv
 import os
+import subprocess
+import sys
 import tempfile
 import tkinter as tk
 from datetime import date, datetime, timedelta
@@ -31,12 +43,12 @@ from tkinter import filedialog, messagebox, ttk
 
 from front_office import (
     AMBER, BACKUP_DIR, BASE_DIR, DATA_DIR, BG, BORDER, CSV_DATE_FMT, DIM, FONT, GREEN, GREEN_HOVER, GREY_BTN, GREY_HOVER,
-    MUTED, ORANGE, PANEL, PANEL_2, RED, RED_HOVER, ROW_A, ROW_B, TAMPERED_BG, TAMPERED_FG, TEAL, TYPE_COUNT,
-    TEAL_HOVER, TEXT, UI_DATE_FMT, YELLOW, LOGO_MARK_WIDTH, Dialog, FieldsDialog, HoverButton, PinDialog, admin_save_path,
+    MUTED, ORANGE, PANEL, PANEL_2, RED, RED_HOVER, ROW_A, ROW_B, TAMPERED_BG, TAMPERED_FG, TEAL, TYPE_COUNT, TYPE_KEPT,
+    TEAL_HOVER, TEXT, TYPE_NOSALE, UI_DATE_FMT, YELLOW, LOGO_MARK_WIDTH, Dialog, FieldsDialog, HoverButton, PinDialog, admin_save_path,
     make_sortable, ORANGE_HOVER,
     PlaceholderEntry, append_csv_rows, backup_log, chain_hash, csv_money, entry_opts, find_logo, fmt_money,
     natural_key, parse_csv_datetime, parse_int, parse_pence, parse_ui_date, read_csv_rows, save_config,
-    summarise, write_csv_export,
+    CardList, friendly_date, number_box, summarise, write_csv_export,
 )
 
 try:
@@ -70,7 +82,7 @@ R_ACCEPTED = "LOG ACCEPTED"
 RENT_TYPES = (R_RECEIPT, R_CHECKED, R_BANKED, R_CANCELLED, R_ACCEPTED)
 
 PAYMENT_KINDS = ["Rent", "Arrears", "Rent + arrears", "Key deposit", "Deposit", "Other"]
-DEFAULT_FIRST_RECEIPT = 6200  # the paper receipt book ends at 6199
+DEFAULT_FIRST_RECEIPT = 6197  # the paper receipt book was used up to 6196; 6197-6199 are void on paper
 DEFAULT_UNBANKED_DAYS = 7
 
 S_AWAITING, S_IN_SAFE, S_BANKED, S_CANCELLED = "awaiting", "in_safe", "banked", "cancelled"
@@ -317,147 +329,157 @@ def receipt_path(p):
 
 
 def make_receipt_pdf(path, p, org, stamp=None):
-    """Draws a receipt laid out like the paper book, in the top half of an A4 page.
-    stamp: None for the original, or e.g. 'COPY' / 'CANCELLED' across it."""
+    """Draws a receipt laid out like the paper book, twice on an A4 page: the tenant's copy at the
+    top and the office copy (kept with the money for checking) below the cut line.
+    stamp: None for the original, or e.g. 'COPY' / 'CANCELLED' across both."""
     if canvas is None:
         raise RuntimeError("The PDF library (reportlab) is not available.")
     W, H = A4
     c = canvas.Canvas(path, pagesize=A4)
     c.setTitle(f"Receipt {p['receipt']}")
     c.setAuthor(f"{org['name1']} {org['name2']}")
-    left, right = 20 * mm, W - 20 * mm
-    top = H - 18 * mm
-    ink = HexColor(INK)
 
-    c.setStrokeColor(HexColor("#c9c9cf"))
-    c.setLineWidth(0.8)
-    c.roundRect(left - 7 * mm, top - 124 * mm, (right - left) + 14 * mm, 132 * mm, 3 * mm)
+    def draw(top, copy_label, footnote):
+        left, right = 20 * mm, W - 20 * mm
+        ink = HexColor(INK)
 
-    # Header: mark, name, address
-    x = left
-    logo = find_logo()
-    if logo and Image is not None:
-        try:
-            img = Image.open(logo).convert("RGBA")
-            mark = img.crop((0, 0, LOGO_MARK_WIDTH, img.height))
-            mh = 21 * mm
-            mw = mh * mark.width / mark.height
-            c.drawImage(ImageReader(mark), left, top - mh, mw, mh, mask="auto")
-            x = left + mw + 5 * mm
-        except Exception:
-            pass  # a receipt without the logo is still a receipt
-    c.setFillColor(ink)
-    c.setFont("Times-Bold", 23)
-    c.drawString(x, top - 8 * mm, org["name1"])
-    c.setFont("Times-Bold", 12.5)
-    c.drawString(x, top - 13.5 * mm, org["name2"])
-    c.setFont("Helvetica", 7.6)
-    c.drawString(x, top - 18 * mm, org["address"])
-    c.drawString(x, top - 21.5 * mm, org["contact"])
+        c.setStrokeColor(HexColor("#c9c9cf"))
+        c.setLineWidth(0.8)
+        c.roundRect(left - 7 * mm, top - 124 * mm, (right - left) + 14 * mm, 132 * mm, 3 * mm)
 
-    c.setFont("Times-Bold", 14)
-    c.drawRightString(right - 27 * mm, top - 8 * mm, "No.")
-    c.setFillColor(HexColor(RECEIPT_RED))
-    c.setFont("Helvetica-Bold", 20)
-    c.drawRightString(right, top - 8.5 * mm, str(p["receipt"]))
-    if p.get("ref"):
+        # Header: mark, name, address
+        x = left
+        logo = find_logo()
+        if logo and Image is not None:
+            try:
+                img = Image.open(logo).convert("RGBA")
+                mark = img.crop((0, 0, LOGO_MARK_WIDTH, img.height))
+                mh = 21 * mm
+                mw = mh * mark.width / mark.height
+                c.drawImage(ImageReader(mark), left, top - mh, mw, mh, mask="auto")
+                x = left + mw + 5 * mm
+            except Exception:
+                pass  # a receipt without the logo is still a receipt
         c.setFillColor(ink)
-        c.setFont("Helvetica-Bold", 11)
-        c.drawRightString(right, top - 15.5 * mm, p["ref"])
-        c.setFont("Times-Bold", 9)
-        c.drawRightString(right - c.stringWidth(p["ref"], "Helvetica-Bold", 11) - 2.5 * mm, top - 15.5 * mm,
-                          "TENANT REF")
+        c.setFont("Times-Bold", 23)
+        c.drawString(x, top - 8 * mm, org["name1"])
+        c.setFont("Times-Bold", 12.5)
+        c.drawString(x, top - 13.5 * mm, org["name2"])
+        c.setFont("Helvetica", 7.6)
+        c.drawString(x, top - 18 * mm, org["address"])
+        c.drawString(x, top - 21.5 * mm, org["contact"])
 
-    c.setStrokeColor(ink)
-    c.setLineWidth(0.9)
-    c.line(left, top - 26 * mm, right, top - 26 * mm)
-    c.setFillColor(ink)
-    c.setFont("Times-Bold", 19)
-    c.drawCentredString((left + right) / 2 - 12 * mm, top - 33.5 * mm, "RECEIPT")
-    c.setFont("Times-Bold", 11)
-    c.drawRightString(right - 26 * mm, top - 33.5 * mm, "DATE:")
-    c.setFont("Helvetica", 12)
-    c.drawRightString(right, top - 33.5 * mm, p["dt"].strftime("%d/%m/%Y"))
-    c.line(left, top - 37 * mm, right, top - 37 * mm)
+        c.setFont("Times-Bold", 14)
+        c.drawRightString(right - 27 * mm, top - 8 * mm, "No.")
+        c.setFillColor(HexColor(RECEIPT_RED))
+        c.setFont("Helvetica-Bold", 20)
+        c.drawRightString(right, top - 8.5 * mm, str(p["receipt"]))
+        if p.get("ref"):
+            c.setFillColor(ink)
+            c.setFont("Helvetica-Bold", 11)
+            c.drawRightString(right, top - 15.5 * mm, p["ref"])
+            c.setFont("Times-Bold", 9)
+            c.drawRightString(right - c.stringWidth(p["ref"], "Helvetica-Bold", 11) - 2.5 * mm, top - 15.5 * mm,
+                              "TENANT REF")
 
-    def field(y, label, value, value_x=None, until=right, size=12):
+        c.setStrokeColor(ink)
+        c.setLineWidth(0.9)
+        c.line(left, top - 26 * mm, right, top - 26 * mm)
         c.setFillColor(ink)
+        c.setFont("Times-Bold", 19)
+        c.drawCentredString((left + right) / 2 - 12 * mm, top - 33.5 * mm, "RECEIPT")
+        c.setFont("Times-Bold", 11)
+        c.drawRightString(right - 26 * mm, top - 33.5 * mm, "DATE:")
+        c.setFont("Helvetica", 12)
+        c.drawRightString(right, top - 33.5 * mm, p["dt"].strftime("%d/%m/%Y"))
+        c.line(left, top - 37 * mm, right, top - 37 * mm)
+
+        def field(y, label, value, value_x=None, until=right, size=12):
+            c.setFillColor(ink)
+            c.setFont("Times-Bold", 10.5)
+            c.drawString(left, y, label)
+            vx = value_x or left + c.stringWidth(label, "Times-Bold", 10.5) + 3 * mm
+            c.setStrokeColor(HexColor("#8a8a92"))
+            c.setLineWidth(0.6)
+            c.setDash(0.8, 1.6)
+            c.line(vx, y - 1.4 * mm, until, y - 1.4 * mm)
+            c.setDash()
+            room = until - vx - 2 * mm
+            while size > 9 and c.stringWidth(value, "Helvetica", size) > room:
+                size -= 0.5  # shrink a long name or address to fit rather than cut it off
+            c.setFont("Helvetica", size)
+            lines = simpleSplit(value, "Helvetica", size, room) or [""]
+            c.drawString(vx + 1.5 * mm, y + 0.3 * mm, lines[0])
+            return lines[1:]
+
+        y = top - 46 * mm
         c.setFont("Times-Bold", 10.5)
-        c.drawString(left, y, label)
-        vx = value_x or left + c.stringWidth(label, "Times-Bold", 10.5) + 3 * mm
+        c.drawString(left, y, "RECEIVED WITH THANKS FROM")
+        y -= 9 * mm
+        more = field(y, "MR/MRS/MISS", p["name"])
+        if more:  # still too long at the smallest size: finish it on the line below
+            y -= 6 * mm
+            field(y, "", " ".join(more), value_x=left + 27 * mm)
+        y -= 9 * mm
+        more = field(y, "OF", p["address"])
+        if more:
+            y -= 7 * mm
+            field(y, "", " ".join(more), value_x=left + 9 * mm)
+        y -= 9 * mm
+        what = p["kind"] + (f" – {p['details']}" if p["details"] else "")
+        field(y, "FOR", what)
+        y -= 9 * mm
+        field(y, "THE SUM OF", amount_in_words(p["total"]), size=11)
+        y -= 10 * mm
+        mid = (left + right) / 2 + 8 * mm
+        field(y, "CASH £", f"{p['cash'] / 100:,.2f}" if p["cash"] else "—", until=mid - 10 * mm)
+        c.setFont("Times-Bold", 10.5)
+        c.drawString(mid, y, "CHEQUE £")
         c.setStrokeColor(HexColor("#8a8a92"))
-        c.setLineWidth(0.6)
         c.setDash(0.8, 1.6)
-        c.line(vx, y - 1.4 * mm, until, y - 1.4 * mm)
+        c.line(mid + 20 * mm, y - 1.4 * mm, right, y - 1.4 * mm)
         c.setDash()
-        room = until - vx - 2 * mm
-        while size > 9 and c.stringWidth(value, "Helvetica", size) > room:
-            size -= 0.5  # shrink a long name or address to fit rather than cut it off
-        c.setFont("Helvetica", size)
-        lines = simpleSplit(value, "Helvetica", size, room) or [""]
-        c.drawString(vx + 1.5 * mm, y + 0.3 * mm, lines[0])
-        return lines[1:]
+        c.setFont("Helvetica", 12)
+        c.drawString(mid + 21.5 * mm, y + 0.3 * mm, f"{p['cheque'] / 100:,.2f}" if p["cheque"] else "—")
+        y -= 11 * mm
+        field(y, "RECEIVED BY", p["taken_by"], until=right)
 
-    y = top - 46 * mm
-    c.setFont("Times-Bold", 10.5)
-    c.drawString(left, y, "RECEIVED WITH THANKS FROM")
-    y -= 9 * mm
-    more = field(y, "MR/MRS/MISS", p["name"])
-    if more:  # still too long at the smallest size: finish it on the line below
-        y -= 6 * mm
-        field(y, "", " ".join(more), value_x=left + 27 * mm)
-    y -= 9 * mm
-    more = field(y, "OF", p["address"])
-    if more:
-        y -= 7 * mm
-        field(y, "", " ".join(more), value_x=left + 9 * mm)
-    y -= 9 * mm
-    what = p["kind"] + (f" – {p['details']}" if p["details"] else "")
-    field(y, "FOR", what)
-    y -= 9 * mm
-    field(y, "THE SUM OF", amount_in_words(p["total"]), size=11)
-    y -= 10 * mm
-    mid = (left + right) / 2 + 8 * mm
-    field(y, "CASH £", f"{p['cash'] / 100:,.2f}" if p["cash"] else "—", until=mid - 10 * mm)
-    c.setFont("Times-Bold", 10.5)
-    c.drawString(mid, y, "CHEQUE £")
-    c.setStrokeColor(HexColor("#8a8a92"))
-    c.setDash(0.8, 1.6)
-    c.line(mid + 20 * mm, y - 1.4 * mm, right, y - 1.4 * mm)
-    c.setDash()
-    c.setFont("Helvetica", 12)
-    c.drawString(mid + 21.5 * mm, y + 0.3 * mm, f"{p['cheque'] / 100:,.2f}" if p["cheque"] else "—")
-    y -= 11 * mm
-    field(y, "RECEIVED BY", p["taken_by"], until=right)
+        # No handwritten signature: the receipt says so, and who issued it and when.
+        c.setFillColor(ink)
+        c.setFont("Helvetica-Bold", 8)
+        c.drawString(left, top - 115.5 * mm, "This is a computer-generated receipt and is valid without a signature.")
+        c.setFillColor(HexColor("#6b6b73"))
+        c.setFont("Helvetica", 7.5)
+        c.drawString(left, top - 119.5 * mm, f"Issued by {p['taken_by']} on {p['dt']:%d/%m/%Y at %H:%M}. "
+                                             + footnote)
+        c.setFillColor(HexColor("#6b6b73"))
+        c.setFont("Helvetica-Bold", 8)
+        c.drawRightString(right, top + 2.5 * mm, copy_label)
 
-    # No handwritten signature: the receipt says so, and who issued it and when.
-    c.setFillColor(ink)
-    c.setFont("Helvetica-Bold", 8)
-    c.drawString(left, top - 115.5 * mm, "This is a computer-generated receipt and is valid without a signature.")
-    c.setFillColor(HexColor("#6b6b73"))
-    c.setFont("Helvetica", 7.5)
-    c.drawString(left, top - 119.5 * mm, f"Issued by {p['taken_by']} on {p['dt']:%d/%m/%Y at %H:%M}. "
-                                         "Please keep this receipt for your records.")
+        if stamp:
+            c.saveState()
+            c.translate(W / 2, top - 62 * mm)
+            c.rotate(18)
+            red = stamp == "CANCELLED"
+            c.setFillColor(Color(0.70, 0.15, 0.12) if red else Color(0.45, 0.45, 0.5))
+            c.setFillAlpha(0.22)
+            c.setFont("Helvetica-Bold", 64)
+            c.drawCentredString(0, -10, stamp)
+            c.restoreState()
 
-    if stamp:
-        c.saveState()
-        c.translate(W / 2, top - 62 * mm)
-        c.rotate(18)
-        red = stamp == "CANCELLED"
-        c.setFillColor(Color(0.70, 0.15, 0.12) if red else Color(0.45, 0.45, 0.5))
-        c.setFillAlpha(0.22)
-        c.setFont("Helvetica-Bold", 64)
-        c.drawCentredString(0, -10, stamp)
-        c.restoreState()
+    draw(H - 18 * mm, "TENANT'S COPY", "Please keep this receipt for your records.")
+    draw(H / 2 - 16 * mm, "OFFICE COPY", "Office copy: keep with the money until it is checked.")
 
-    # cut line across the middle of the page
+    # cut line across the middle of the page, with "cut here" in a gap in it (on neither copy)
+    c.setFont("Helvetica", 7)
+    gap = c.stringWidth("cut here", "Helvetica", 7) / 2 + 2 * mm
     c.setStrokeColor(HexColor("#b0b0b8"))
     c.setDash(4, 3)
-    c.line(10 * mm, H / 2, W - 10 * mm, H / 2)
+    c.line(10 * mm, H / 2, W / 2 - gap, H / 2)
+    c.line(W / 2 + gap, H / 2, W - 10 * mm, H / 2)
     c.setDash()
     c.setFillColor(HexColor("#9a9aa2"))
-    c.setFont("Helvetica", 7)
-    c.drawString(12 * mm, H / 2 + 1.5 * mm, "cut here")
+    c.drawCentredString(W / 2, H / 2 - 2.4, "cut here")
     c.showPage()
     c.save()
 
@@ -673,7 +695,7 @@ def make_token_banking_sheet_pdf(path, b, petty_receipts, org):
     c.setFont("Helvetica", 9)
     c.setFillColor(HexColor("#6b6b73"))
     period = (f"{rows[0]['dt']:%d/%m/%Y} to {rows[-1]['dt']:%d/%m/%Y}" if rows else "no transactions")
-    c.drawString(left, y - 5 * mm, f"Everything since the drawer was last emptied: {period}")
+    c.drawString(left, y - 5 * mm, f"Everything since the drawer was last banked: {period}")
     y -= 14 * mm
 
     s = summarise(rows, petty_receipts)
@@ -690,12 +712,21 @@ def make_token_banking_sheet_pdf(path, b, petty_receipts, org):
     y -= 6 * mm
     diff = b["difference"]
     counts = sum(r["total"] for r in rows if r["type"] == TYPE_COUNT)
-    lines = [("Drawer count corrections (see the log)", ("+" if counts > 0 else "") + fmt_money(counts), False)] \
+    kept_before = sum(r["total"] for r in rows if r["type"] == TYPE_KEPT)
+    lines = [("Kept in the drawer at the last banking", fmt_money(kept_before), False)] if kept_before else []
+    lines += [("Drawer count corrections (see the log)", ("+" if counts > 0 else "") + fmt_money(counts), False)] \
         if counts else []
-    lines += [("Should have been in the drawer", fmt_money(b["expected"]), False),
-              ("Counted and paid in", fmt_money(b["paid"]), True)]
-    if diff:
-        lines.append(("Over" if diff > 0 else "Short", fmt_money(abs(diff)), True))
+    lines += [("Should have been in the drawer", fmt_money(b["expected"]), False)]
+    if b["kept"]:
+        lines.append(("Counted in the drawer", fmt_money(b["counted"]), False))
+        if diff:
+            lines.append(("Over" if diff > 0 else "Short", fmt_money(abs(diff)), True))
+        lines += [("Left in the drawer", fmt_money(b["kept"]), False),
+                  ("Paid in", fmt_money(b["paid"]), True)]
+    else:
+        lines.append(("Counted and paid in", fmt_money(b["paid"]), True))
+        if diff:
+            lines.append(("Over" if diff > 0 else "Short", fmt_money(abs(diff)), True))
     for label, value, bold in lines:
         c.setFillColor(HexColor(RECEIPT_RED) if label in ("Over", "Short") else ink)
         c.setFont("Helvetica-Bold" if bold else "Helvetica", 11 if bold else 10)
@@ -801,6 +832,51 @@ def open_file(path):
     os.startfile(path)  # opens in the default PDF viewer, ready to print
 
 
+PRINTER_EXE = "SumatraPDF.exe"  # bundled into the .exe; prints a PDF with no window
+
+
+def find_printer_exe():
+    for folder in (BASE_DIR, os.path.join(BASE_DIR, "source"), getattr(sys, "_MEIPASS", None)):
+        if folder and os.path.exists(os.path.join(folder, PRINTER_EXE)):
+            return os.path.join(folder, PRINTER_EXE)
+    return None
+
+
+def print_file(path, parent, what):
+    """Sends a PDF straight to the default printer, without opening it. If it can't be printed
+    (no printer, printer offline, SumatraPDF missing) the PDF is opened instead, to print by hand."""
+    exe = find_printer_exe()
+
+    def fall_back(problem):
+        messagebox.showwarning("Printing", f"The {what} could not be printed automatically ({problem}).\n\n"
+                               "It will open now so you can print it.", parent=parent)
+        open_file(path)
+
+    if exe is None:
+        fall_back("the printing program is missing")
+        return
+    try:
+        proc = subprocess.Popen([exe, "-print-to-default", "-print-settings", "noscale", "-silent", path],
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except OSError as e:
+        fall_back(str(e))
+        return
+    started = datetime.now()
+
+    def check():  # polled so the screen doesn't freeze while it prints
+        code = proc.poll()
+        if code is None:
+            if (datetime.now() - started).seconds < 60:
+                parent.after(500, check)
+            else:
+                proc.kill()
+                fall_back("the printer did not respond")
+        elif code != 0:
+            fall_back("check the default printer is set up and switched on")
+
+    parent.after(500, check)
+
+
 # --------------------------------------------------------------------------
 # Store: the log plus derived payments
 # --------------------------------------------------------------------------
@@ -827,9 +903,23 @@ class RentStore:
         if tip and not any(e["entry"] == tip["entry"] and e["check"] == tip["check"] for e in self.entries):
             problems.append(f"Rent log entry #{tip['entry']}, the last one the app wrote, is missing or changed. "
                             "Entries may have been deleted from the end of the rent log.")
+        missing = self.missing_receipts()
+        if missing:
+            shown = ", ".join(map(str, missing[:12])) + (" …" if len(missing) > 12 else "")
+            problems.append(f"{len(missing)} receipt number{' is' if len(missing) == 1 else 's are'} missing from "
+                            f"the rent log: {shown}. Receipts may have been deleted.")
         if not tip:
             self._set_tip()
         return problems
+
+    def missing_receipts(self):
+        """Numbers between the first receipt and the highest ever issued that aren't in the log,
+        not counting any an admin has already accepted (Settings → Logs)."""
+        used = {e["receipt"] for e in self.entries if e["type"] == R_RECEIPT and e["receipt"] is not None}
+        top = max(used | {self.last_issued()})
+        accepted = max((e["receipt"] or 0 for e in self.entries if e["type"] == R_ACCEPTED), default=0)
+        start = max(min(used | {self.first_receipt()}), accepted + 1)
+        return [n for n in range(start, top + 1) if n not in used]
 
     def reverify(self):
         """Daily, on a PC left running: a dated backup, then the log read back and checked again."""
@@ -844,6 +934,8 @@ class RentStore:
     def _set_tip(self):
         last = self.entries[-1] if self.entries else None
         self.app.cfg["rent_log_tip"] = {"entry": last["entry"], "check": last["check"]} if last else None
+        self.app.cfg["rent_last_receipt"] = max([self.last_issued()] + [e["receipt"] for e in self.entries
+                                                                          if e["type"] == R_RECEIPT and e["receipt"]])
         try:
             save_config(self.app.cfg)
         except OSError:
@@ -860,8 +952,10 @@ class RentStore:
         self._payments = None
         self.problems = []
         self._set_tip()
-        self.write([dict(type=R_ACCEPTED, staff=admin_name,
-                         notes=f"{reason}. Flagged log kept as backups\\{os.path.basename(backup)}")], parent)
+        missing = self.missing_receipts()
+        gone = f" Receipt numbers missing: {', '.join(map(str, missing))}." if missing else ""
+        self.write([dict(type=R_ACCEPTED, staff=admin_name, receipt=self.next_receipt() - 1,
+                         notes=f"{reason}.{gone} Flagged log kept as backups\\{os.path.basename(backup)}")], parent)
         return True
 
     # ---- writing ---------------------------------------------------------
@@ -912,7 +1006,7 @@ class RentStore:
                 }
         for e in self.entries:
             p = pays.get(e["receipt"])
-            if p is None or e["type"] == R_RECEIPT:
+            if p is None or e["type"] in (R_RECEIPT, R_ACCEPTED):
                 continue
             p["tampered"] = p["tampered"] or e["tampered"]
             if e["type"] == R_CHECKED:
@@ -935,10 +1029,16 @@ class RentStore:
             return S_IN_SAFE
         return S_AWAITING
 
+    def first_receipt(self):
+        return parse_int(self.app.cfg.get("rent_first_receipt"), DEFAULT_FIRST_RECEIPT) or DEFAULT_FIRST_RECEIPT
+
+    def last_issued(self):
+        """The highest receipt number ever issued, as remembered in config.json (0 if none)."""
+        return parse_int(self.app.cfg.get("rent_last_receipt"), 0)
+
     def next_receipt(self):
-        first = int(self.app.cfg.get("rent_first_receipt", DEFAULT_FIRST_RECEIPT))
         used = [e["receipt"] for e in self.entries if e["receipt"] is not None]
-        return max([first] + [n + 1 for n in used])
+        return max([self.first_receipt(), self.last_issued() + 1] + [n + 1 for n in used])
 
     def next_deposit(self):
         used = [parse_int(e["deposit"].lstrip("D"), 0) for e in self.entries if e["type"] == R_BANKED]
@@ -1054,13 +1154,13 @@ class RentView(tk.Frame):
         self.name_entry.pack(fill="x", ipady=5)
         self.name_entry.bind("<KeyRelease>", lambda e: self._update_matches())
         self.name_entry.bind("<Down>", lambda e: self._focus_matches())
-        self.matches = tk.Listbox(p, height=self.MATCH_ROWS, bg=PANEL_2, fg=TEXT, font=(FONT, 10), relief="flat",
+        self.matches = tk.Listbox(p, height=self.MATCH_ROWS, bg=PANEL_2, fg=TEXT, font=(FONT, 12), relief="flat",
                                   highlightthickness=0, bd=0, selectbackground=TEAL, selectforeground="#ffffff",
                                   activestyle="none")
         self.matches.pack(fill="x", pady=(2, 0))
         self.matches.bind("<<ListboxSelect>>", lambda e: self._pick_match())
         self.matches.bind("<Return>", lambda e: self._pick_match(move_on=True))
-        self.address_entry = PlaceholderEntry(p, "Address, e.g. Rm 3, 91 Wellesley Road")
+        self.address_entry = PlaceholderEntry(p, "Address, e.g. Rm 3, 12 High Street")
         self.address_entry.pack(fill="x", ipady=5, pady=(8, 0))
         self.address_entry.bind("<KeyRelease>", lambda e: self._update_new_tenant())
         status = tk.Frame(p, bg=PANEL)
@@ -1112,8 +1212,8 @@ class RentView(tk.Frame):
     def _amount_box(self, parent, label, col, vcmd):
         tk.Label(parent, text=label, font=(FONT, 11, "bold"), fg=MUTED, bg=PANEL).grid(
             row=0, column=col, sticky="w", padx=(0 if col == 0 else 12, 6))
-        e = tk.Entry(parent, width=9, validate="key", validatecommand=vcmd, justify="right",
-                     **entry_opts(font=(FONT, 15)))
+        e = number_box(tk.Entry(parent, width=9, validate="key", validatecommand=vcmd, justify="right",
+                                **entry_opts(font=(FONT, 15))))
         e.grid(row=0, column=col + 1, sticky="ew", ipady=3)
         e.bind("<KeyRelease>", lambda ev: self.update_total())
         return e
@@ -1291,30 +1391,10 @@ class RentView(tk.Frame):
 
         table = tk.Frame(main, bg=PANEL)
         table.grid(row=2, column=0, sticky="nsew")
-        columns = [("receipt", "Receipt", 70, "w"), ("date", "Date", 90, "w"), ("name", "Tenant", 170, "w"),
-                   ("ref", "Ref", 60, "w"), ("address", "Address", 190, "w"), ("kind", "For", 170, "w"),
-                   ("total", "Amount", 90, "e"),
-                   ("method", "Paid by", 120, "w"), ("taken", "Taken by", 110, "w"), ("status", "Status", 220, "w")]
-        self.tree = ttk.Treeview(table, columns=[c[0] for c in columns], show="headings", style="Dark.Treeview",
-                                 selectmode="extended")
-        for key, text, width, anchor in columns:
-            self.tree.heading(key, text=text, anchor=anchor)
-            self.tree.column(key, width=S(width), minwidth=S(40), anchor=anchor,
-                             stretch=key in ("name", "address", "status"))
-        sb = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=sb.set)
-        self.tree.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
-        self.tree.tag_configure("tampered", background=TAMPERED_BG, foreground=TAMPERED_FG)  # first = wins
-        self.tree.tag_configure("even", background=ROW_A)
-        self.tree.tag_configure("odd", background=ROW_B)
-        self.tree.tag_configure(S_AWAITING, foreground=YELLOW)
-        self.tree.tag_configure(S_IN_SAFE, foreground=TEXT)
-        self.tree.tag_configure(S_BANKED, foreground=MUTED)
-        self.tree.tag_configure(S_CANCELLED, foreground=DIM, font=(FONT, 10, "overstrike"))
-        self.tree.bind("<Double-1>", lambda e: self.reprint_selected())
-        make_sortable(self.tree)
-        self.empty_label = tk.Label(table, text="", font=(FONT, 11), fg=MUTED, bg=ROW_A)
+        # several can be ticked at once, e.g. to check or bank a few payments together
+        self.receipt_cards = CardList(table, self.app, on_open=self.reprint_selected, multi=True)
+        self.receipt_cards.pack(fill="both", expand=True)
+        self.empty_label = tk.Label(table, text="", font=(FONT, 11), fg=MUTED, bg=PANEL)
         self.set_filter("open")
 
     def set_filter(self, key):
@@ -1325,6 +1405,7 @@ class RentView(tk.Frame):
             else:
                 btn.set_colors(GREY_BTN, GREY_HOVER, TEXT)
         self.refresh_table()
+        self.receipt_cards.scroll_top()
 
     def refresh(self):
         self.refresh_cards()
@@ -1374,10 +1455,32 @@ class RentView(tk.Frame):
             return f"Banked {p['bank_date']:%d/%m/%Y} · {p['deposit']} · {p['banked_by']}"
         return f"Cancelled · {p['cancel_reason']}"
 
+    def _add_card(self, p, status, kind, method):
+        """One receipt as a card: who paid and how much, what for, then the receipt and where the
+        money is now, with that in the badge."""
+        ref = f"ref {p['ref']}" if p["ref"] else "new tenant"
+        when = (f"Receipt {p['receipt']}  ·  {friendly_date(p['dt'])} {p['dt']:%H:%M}  ·  {method}  ·  "
+                f"taken by {p['taken_by']}")
+        if status == S_AWAITING:
+            badge, color = "Awaiting check", AMBER
+        elif status == S_IN_SAFE:
+            badge, color = "In safe", ORANGE
+            when += f"  ·  checked by {p['checked_by']} {friendly_date(p['checked_at'])}"
+        elif status == S_BANKED:
+            badge, color = "Banked", GREEN
+            when += f"  ·  banked {friendly_date(p['bank_date'])} ({p['deposit']}) by {p['banked_by']}"
+        else:
+            badge, color = "Cancelled", DIM
+            when += f"  ·  cancelled: {p['cancel_reason']}"
+        self.receipt_cards.add(p["receipt"], f"{p['name']}  ·  {fmt_money(p['total'])}",
+                          (f"{kind}  ·  {p['address']}  ·  {ref}", when), badge, color,
+                          quiet=status in (S_BANKED, S_CANCELLED), faded=status == S_CANCELLED,
+                          flagged=p["tampered"])
+
     def refresh_table(self):
         query = self.search.value().lower()
-        selected = self.tree.selection()
-        self.tree.delete(*self.tree.get_children())
+        selected = self.receipt_cards.selection()
+        self.receipt_cards.clear()
         wanted = {"open": (S_AWAITING, S_IN_SAFE), "awaiting": (S_AWAITING,), "in_safe": (S_IN_SAFE,),
                   "banked": (S_BANKED,), "cancelled": (S_CANCELLED,),
                   "all": (S_AWAITING, S_IN_SAFE, S_BANKED, S_CANCELLED)}[self.filter]
@@ -1392,13 +1495,10 @@ class RentView(tk.Frame):
                       fmt_money(p["total"]), method, p["taken_by"], self.status_text(p))
             if query and not any(query in str(v).lower() for v in values):
                 continue
-            tags = ["odd" if shown % 2 else "even", status] + (["tampered"] if p["tampered"] else [])
-            self.tree.insert("", "end", iid=str(p["receipt"]), values=values, tags=tags)
+            self._add_card(p, status, kind, method)
             shown += 1
-        self.tree.resort()
-        keep = [i for i in selected if self.tree.exists(i)]
-        if keep:
-            self.tree.selection_set(keep)
+        self.receipt_cards.finish()
+        self.receipt_cards.selection_set([i for i in selected if self.receipt_cards.exists(i)])
         if shown:
             self.empty_label.place_forget()
         else:
@@ -1410,7 +1510,7 @@ class RentView(tk.Frame):
 
     def selected_payments(self):
         pays = self.store.payments()
-        return [pays[int(i)] for i in self.tree.selection() if int(i) in pays]
+        return [pays[int(i)] for i in self.receipt_cards.selection() if int(i) in pays]
 
     # ---- actions ---------------------------------------------------------
     def take_payment(self):
@@ -1426,16 +1526,18 @@ class RentView(tk.Frame):
         dlg = PinDialog(self.app, self.app, "Take payment", f"Receipt {receipt}  ·  {fmt_money(cash + cheque)}",
                         [name + (f"  ·  ref {ref}" if ref else "  ·  new tenant (no ref)"), address,
                          self.kind + (f" – {details}" if details else ""), paid],
-                        confirm_text="Take payment & print receipt")
+                        confirm_text="Take payment & print receipt", cash_due=cash or None)
         result = dlg.show()
         if not result:
             self.app._pin_locked_out(dlg)
             return
         staff, _ = result
+        change = dlg.change_pence
+        notes = f"Cash given {fmt_money(dlg.given_pence)}, change {fmt_money(change)}" if change else ""
         saved = self.store.write([dict(type=R_RECEIPT, receipt=receipt, name=name, ref=ref, address=address,
                                        kind=self.kind,
                                        details=details, cash=cash, cheque=cheque, total=cash + cheque,
-                                       staff=staff["name"])], self.app)
+                                       staff=staff["name"], notes=notes)], self.app)
         if not saved:
             return
         if self.add_tenant_var.get() and not self._known_tenant():
@@ -1450,22 +1552,37 @@ class RentView(tk.Frame):
         self.set_filter("open")
         self.refresh()
         self.app.refresh_warning()
+        drawer_ok = True
+        if change:
+            # Rent cash doesn't go in the token drawer, so it opens only to give change: the note goes in
+            # and the payment plus the change come out, so the drawer total doesn't change. Recorded as a
+            # no-sale so every opening is in the token log.
+            rec = self.app.record_event(TYPE_NOSALE, "", "", 0, 0, 0, staff["name"], parent=self.app, notes=(
+                f"Change for rent receipt {receipt}: {fmt_money(dlg.given_pence)} in, {fmt_money(cash)} with the "
+                f"receipt + {fmt_money(change)} change out"))
+            drawer_ok = rec is not None and self.app._open_drawer_after(rec, "change for the rent payment")
         self._issue_receipt(p)
-        self.app.set_message(f"✓ Receipt {receipt}: {fmt_money(p['total'])} from {name}. Put the money with the "
-                             "receipt copy for checking.", GREEN,
-                             action=("Give change", lambda: self.app.no_sale(f"Change for rent receipt {receipt}"))
-                             if cash else None)
+        if change:
+            self.app.set_message(f"✓ Receipt {receipt}: {fmt_money(p['total'])} from {name}  ·  PUT THE "
+                                 f"{fmt_money(dlg.given_pence)} IN THE DRAWER, TAKE OUT {fmt_money(cash)} FOR THE "
+                                 f"RECEIPT AND GIVE {fmt_money(change)} CHANGE"
+                                 + ("" if drawer_ok else "  (drawer did not open)"), GREEN if drawer_ok else YELLOW)
+        else:
+            self.app.set_message(f"✓ Receipt {receipt}: {fmt_money(p['total'])} from {name}. Put the money with the "
+                                 "receipt copy for checking." + ("" if drawer_ok else "  (drawer did not open)"),
+                                 GREEN if drawer_ok else YELLOW)
 
     def _issue_receipt(self, p):
         path = receipt_path(p)
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             make_receipt_pdf(path, p, self.store.org())
-            open_file(path)
         except Exception as e:
             messagebox.showwarning("Receipt", f"Payment {p['receipt']} IS recorded, but the receipt could not be "
-                                   f"created or opened:\n\n{e}\n\nSelect it and press Reprint to try again.",
+                                   f"created:\n\n{e}\n\nSelect it and press Reprint to try again.",
                                    parent=self.app)
+            return
+        print_file(path, self.app, f"receipt {p['receipt']} (it IS recorded)")
 
     def reprint_selected(self):
         sel = self.selected_payments()
@@ -1477,7 +1594,7 @@ class RentView(tk.Frame):
     def check_selected(self):
         sel = [p for p in self.selected_payments() if self.store.status(p) == S_AWAITING]
         if not sel:
-            messagebox.showinfo("Check", "Select the payments to check (Awaiting check). Hold Ctrl to select several.",
+            messagebox.showinfo("Check", "Select the payments to check (Awaiting check). Tap each one you want; several at once is fine.",
                                 parent=self.app)
             return
         takers = {p["taken_by"] for p in sel}
@@ -1539,9 +1656,9 @@ class RentView(tk.Frame):
             return None
 
         res = FieldsDialog(self.app, "Bank payments", f"Bank {len(sel)} payment{'s' if len(sel) != 1 else ''}", [
-            {"key": "date", "label": "Date paid in at the bank", "value": date.today().strftime(UI_DATE_FMT)},
+            {"key": "date", "kind": "date", "label": "Date paid in at the bank", "value": date.today().strftime(UI_DATE_FMT)},
             {"key": "slip", "label": "Paying-in slip reference (optional)"},
-            {"key": "amount", "label": f"Total on the paying-in slip (£)"},
+            {"key": "amount", "label": f"Total on the paying-in slip (£)", "kind": "money"},
         ], validate=validate, confirm_text="Next",
             sub=f"Selected: {fmt_money(total)}  (cash {fmt_money(cash)}, cheques {fmt_money(cheque)}). "
                 "Enter the slip total to confirm it matches.").show()
@@ -1586,7 +1703,8 @@ class RentView(tk.Frame):
         dlg = PinDialog(self.app, self.app, "Cancel receipt", f"Cancel receipt {p['receipt']}",
                         [f"{p['name']}  ·  {fmt_money(p['total'])}", f"{p['kind']} on {p['dt']:%d/%m/%Y}",
                          f"The number is not reused. {where}"],
-                        allow=lambda s: None if (s["admin"] or is_checker(s)) else
+                        allow=lambda s: "You took this payment, so someone else must cancel it"
+                        if s["name"] == p["taken_by"] else None if (s["admin"] or is_checker(s)) else
                         "Only an admin or checker can cancel receipts",
                         reason_label="Reason (e.g. wrong amount, reissued as next receipt)",
                         confirm_text="Cancel receipt", confirm_bg=RED, confirm_hover=RED_HOVER)
@@ -1628,10 +1746,10 @@ class RentHistoryWindow(Dialog):
         bar = tk.Frame(self.body, bg=PANEL)
         bar.pack(fill="x", pady=(14, 0))
         tk.Label(bar, text="From", font=(FONT, 10, "bold"), fg=MUTED, bg=PANEL).pack(side="left")
-        self.from_entry = tk.Entry(bar, width=11, **entry_opts())
+        self.from_entry = number_box(tk.Entry(bar, width=11, **entry_opts()), "date")
         self.from_entry.pack(side="left", padx=(6, 12), ipady=4)
         tk.Label(bar, text="To", font=(FONT, 10, "bold"), fg=MUTED, bg=PANEL).pack(side="left")
-        self.to_entry = tk.Entry(bar, width=11, **entry_opts())
+        self.to_entry = number_box(tk.Entry(bar, width=11, **entry_opts()), "date")
         self.to_entry.pack(side="left", padx=(6, 8), ipady=4)
         HoverButton(bar, text="Show", bg=TEAL, hover=TEAL_HOVER, font=(FONT, 10, "bold"),
                     command=self.run).pack(side="left", padx=(0, 16))
@@ -1789,10 +1907,10 @@ class RentReportsWindow(Dialog):
         bar = tk.Frame(self.body, bg=PANEL)
         bar.pack(fill="x", pady=(16, 0))
         tk.Label(bar, text="From", font=(FONT, 10, "bold"), fg=MUTED, bg=PANEL).pack(side="left")
-        self.from_entry = tk.Entry(bar, width=11, **entry_opts())
+        self.from_entry = number_box(tk.Entry(bar, width=11, **entry_opts()), "date")
         self.from_entry.pack(side="left", padx=(6, 12), ipady=4)
         tk.Label(bar, text="To", font=(FONT, 10, "bold"), fg=MUTED, bg=PANEL).pack(side="left")
-        self.to_entry = tk.Entry(bar, width=11, **entry_opts())
+        self.to_entry = number_box(tk.Entry(bar, width=11, **entry_opts()), "date")
         self.to_entry.pack(side="left", padx=(6, 8), ipady=4)
         HoverButton(bar, text="Show", bg=TEAL, hover=TEAL_HOVER, font=(FONT, 10, "bold"),
                     command=self.run).pack(side="left", padx=(0, 16))
@@ -2024,7 +2142,7 @@ def build_tenants_tab(win, p):
     def dialog(heading, t=None):
         return FieldsDialog(win, "Tenant", heading, [
             {"key": "name", "label": "Tenant name", "value": t["name"] if t else ""},
-            {"key": "address", "label": "Address (e.g. Rm 3, 91 Wellesley Road)", "value": t["address"] if t else ""},
+            {"key": "address", "label": "Address (e.g. Rm 3, 12 High Street)", "value": t["address"] if t else ""},
             {"key": "ref", "label": "Tenant ref (Ten Key in the housing system; blank if not set up yet)",
              "value": t["ref"] if t else ""},
         ], validate=lambda v: None if v["name"] else "Please enter a name.").show()

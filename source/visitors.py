@@ -26,7 +26,7 @@ from tkinter import messagebox, ttk
 from front_office import (
     AMBER, BG, BLUE, DATA_DIR, DIM, FONT, GREEN, GREEN_HOVER, GREY_BTN, GREY_HOVER, MUTED, PANEL, PINK, RED,
     RED_HOVER, ROW_A, ROW_B, TAMPERED_BG, TAMPERED_FG, TEAL, TEAL_HOVER, TEXT, FieldsDialog, HoverButton, PinDialog,
-    PlaceholderEntry, admin_save_path, make_sortable, parse_int,
+    PlaceholderEntry, admin_save_path, make_sortable, parse_int, CardList, friendly_date,
 )
 from logbook import ChainLog
 from rent import open_file, write_xlsx
@@ -294,36 +294,16 @@ class VisitorView(tk.Frame):
 
         table = tk.Frame(main, bg=PANEL)
         table.grid(row=2, column=0, sticky="nsew")
-        columns = [("no", "Visit", 70, "w"), ("date", "Date", 100, "w"), ("in", "In", 60, "w"),
-                   ("out", "Out", 60, "w"), ("name", "Name", 170, "w"), ("company", "Company", 150, "w"),
-                   ("visiting", "Visiting", 150, "w"), ("car", "Car reg", 90, "w"), ("staff", "Logged by", 110, "w"),
-                   ("status", "Status", 180, "w")]
-        self.tree = ttk.Treeview(table, columns=[c[0] for c in columns], show="headings", style="Dark.Treeview",
-                                 selectmode="browse")
-        for key, text, width, anchor in columns:
-            self.tree.heading(key, text=text, anchor=anchor)
-            self.tree.column(key, width=S(width), minwidth=S(40), anchor=anchor,
-                             stretch=key in ("name", "company", "visiting", "status"))
-        sb = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=sb.set)
-        self.tree.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
-        self.tree.tag_configure("tampered", background=TAMPERED_BG, foreground=TAMPERED_FG)  # first = wins
-        self.tree.tag_configure("even", background=ROW_A)
-        self.tree.tag_configure("odd", background=ROW_B)
-        self.tree.tag_configure(S_IN, foreground=TEXT)
-        self.tree.tag_configure("forgotten", foreground=AMBER)
-        self.tree.tag_configure(S_OUT, foreground=MUTED)
-        self.tree.tag_configure(S_VOIDED, foreground=DIM, font=(FONT, 10, "overstrike"))
-        self.tree.bind("<Double-1>", lambda e: self.sign_out())
-        make_sortable(self.tree)
-        self.empty_label = tk.Label(table, text="", font=(FONT, 11), fg=MUTED, bg=ROW_A)
+        self.visit_cards = CardList(table, self.app, on_open=self.sign_out)
+        self.visit_cards.pack(fill="both", expand=True)
+        self.empty_label = tk.Label(table, text="", font=(FONT, 11), fg=MUTED, bg=PANEL)
         self.set_filter("in")
 
     def set_filter(self, key):
         self.filter = key
         self._paint(self.filter_buttons, key)
         self.refresh_table()
+        self.visit_cards.scroll_top()
 
     def refresh(self):
         self.refresh_cards()
@@ -354,10 +334,29 @@ class VisitorView(tk.Frame):
         value.config(text=str(len(month)))
         sub.config(text=plural(len({v["company"] for v in month if v["company"]}), "company"))
 
+    def _add_card(self, v, status):
+        """One visit as a card: who, who they came to see, then when they came and went."""
+        title = v["name"] + (f"  ·  {v['company']}" if v["company"] else "")
+        detail = [f"visiting {v['visiting']}" if v["visiting"] else "", f"car {v['car']}" if v["car"] else "",
+                  v["notes"]]
+        when = f"{visit_name(v['no'])}  ·  in {friendly_date(v['dt'])} {v['dt']:%H:%M}"
+        if status == S_IN:
+            days = (date.today() - v["dt"].date()).days
+            badge, color = ("In the building", PINK) if not days else (f"Not signed out · {plural(days, 'day')}", AMBER)
+        elif status == S_OUT:
+            badge, color = f"Left {v['out_at']:%H:%M}", GREEN
+            when += f"  ·  out {v['out_at']:%H:%M}"
+        else:
+            badge, color = "Voided", DIM
+            when += f"  ·  voided: {v['void_reason']}"
+        when += f"  ·  logged by {v['staff']}"
+        self.visit_cards.add(v["no"], title, ("  ·  ".join(x for x in detail if x), when), badge, color,
+                             quiet=status != S_IN, faded=status == S_VOIDED, flagged=v["tampered"])
+
     def refresh_table(self):
         query = self.search.value().lower()
-        selected = self.tree.selection()
-        self.tree.delete(*self.tree.get_children())
+        selected = self.visit_cards.selection()
+        self.visit_cards.clear()
         today = date.today()
         shown = 0
         for v in sorted(self.store.visits().values(), key=lambda x: x["no"], reverse=True):
@@ -370,16 +369,10 @@ class VisitorView(tk.Frame):
                       v["car"], v["staff"], status_text(v))
             if query and not any(query in str(x).lower() for x in values + (v["notes"],)):
                 continue
-            forgotten = status == S_IN and v["dt"].date() < today
-            tags = ["odd" if shown % 2 else "even", "forgotten" if forgotten else status]
-            if v["tampered"]:
-                tags.append("tampered")
-            self.tree.insert("", "end", iid=str(v["no"]), values=values, tags=tags)
+            self._add_card(v, status)
             shown += 1
-        self.tree.resort()
-        keep = [i for i in selected if self.tree.exists(i)]
-        if keep:
-            self.tree.selection_set(keep)
+        self.visit_cards.finish()
+        self.visit_cards.selection_set([i for i in selected if self.visit_cards.exists(i)])
         if shown:
             self.empty_label.place_forget()
         else:
@@ -389,7 +382,7 @@ class VisitorView(tk.Frame):
             self.empty_label.place(relx=0.5, rely=0.5, anchor="center")
 
     def selected_visit(self, what):
-        sel = self.tree.selection()
+        sel = self.visit_cards.selection()
         if not sel:
             messagebox.showinfo(what, "Select a visitor in the list first.", parent=self.app)
             return None

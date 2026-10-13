@@ -25,7 +25,8 @@ from tkinter import messagebox, ttk
 from front_office import (
     AMBER, BG, DATA_DIR, DIM, FONT, GREEN, GREEN_HOVER, GREY_BTN, GREY_HOVER, MUTED, ORANGE, PANEL, PURPLE, RED,
     RED_HOVER, ROW_A, ROW_B, TAMPERED_BG, TAMPERED_FG, TEAL, TEAL_HOVER, TEXT, YELLOW, FieldsDialog, HoverButton,
-    PinDialog, PlaceholderEntry, admin_save_path, csv_money, make_sortable, entry_opts, fmt_money, parse_int, parse_pence,
+    CardList, PinDialog, PlaceholderEntry, admin_save_path, csv_money, make_sortable, entry_opts, fmt_money, number_box, parse_int,
+    parse_pence, friendly_date,
 )
 from logbook import ChainLog
 from rent import open_file, write_xlsx
@@ -241,8 +242,8 @@ class PostView(tk.Frame):
         tk.Label(row, text="Postage £", font=(FONT, 10, "bold"), fg=MUTED, bg=PANEL).grid(row=0, column=1,
                                                                                          padx=(10, 4))
         vcmd = (self.register(lambda s: all(ch in "0123456789.,£" for ch in s)), "%P")
-        self.cost_entry = tk.Entry(row, width=6, justify="right", validate="key", validatecommand=vcmd,
-                                   **entry_opts())
+        self.cost_entry = number_box(tk.Entry(row, width=6, justify="right", validate="key", validatecommand=vcmd,
+                                              **entry_opts()))
         self.cost_entry.grid(row=0, column=2, ipady=4)
         self.cost_entry.bind("<KeyRelease>", lambda e: self.update_form())
         self._section(f, "3", "About")
@@ -374,36 +375,16 @@ class PostView(tk.Frame):
 
         table = tk.Frame(main, bg=PANEL)
         table.grid(row=2, column=0, sticky="nsew")
-        columns = [("no", "Item", 70, "w"), ("date", "Date", 120, "w"), ("dir", "In / out", 70, "w"),
-                   ("to", "To", 170, "w"), ("from", "From", 170, "w"), ("item", "What / how", 120, "w"),
-                   ("tracking", "Tracking", 120, "w"), ("subject", "Note", 180, "w"), ("staff", "Logged by", 100, "w"),
-                   ("status", "Status", 200, "w")]
-        self.tree = ttk.Treeview(table, columns=[c[0] for c in columns], show="headings", style="Dark.Treeview",
-                                 selectmode="browse")
-        for key, text, width, anchor in columns:
-            self.tree.heading(key, text=text, anchor=anchor)
-            self.tree.column(key, width=S(width), minwidth=S(40), anchor=anchor,
-                             stretch=key in ("to", "from", "subject", "status"))
-        sb = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=sb.set)
-        self.tree.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
-        self.tree.tag_configure("tampered", background=TAMPERED_BG, foreground=TAMPERED_FG)  # first = wins
-        self.tree.tag_configure("even", background=ROW_A)
-        self.tree.tag_configure("odd", background=ROW_B)
-        self.tree.tag_configure(S_WAITING, foreground=YELLOW)
-        self.tree.tag_configure(S_HANDED, foreground=MUTED)
-        self.tree.tag_configure(S_SENT, foreground=TEXT)
-        self.tree.tag_configure(S_VOIDED, foreground=DIM, font=(FONT, 10, "overstrike"))
-        self.tree.bind("<Double-1>", lambda e: self.hand_over())
-        make_sortable(self.tree)
-        self.empty_label = tk.Label(table, text="", font=(FONT, 11), fg=MUTED, bg=ROW_A)
+        self.post_cards = CardList(table, self.app, on_open=self.hand_over)
+        self.post_cards.pack(fill="both", expand=True)
+        self.empty_label = tk.Label(table, text="", font=(FONT, 11), fg=MUTED, bg=PANEL)
         self.set_filter("waiting")
 
     def set_filter(self, key):
         self.filter = key
         self._paint(self.filter_buttons, key)
         self.refresh_table()
+        self.post_cards.scroll_top()
 
     def refresh(self):
         self.refresh_cards()
@@ -432,10 +413,34 @@ class PostView(tk.Frame):
         value.config(text=fmt_money(sum(it["cost"] for it in month)))
         sub.config(text=plural(len(month), "item") + " sent")
 
+    def _add_card(self, it, status, what):
+        """One item as a card: who it's for (or who it went to), what it is and who it's from, then
+        when it was logged, with where it stands in the badge."""
+        if it["incoming"]:
+            title = f"For {it['to']}"
+            detail = [f"from {it['from']}" if it["from"] else "", what, it["tracking"], it["subject"]]
+        else:
+            title = f"Sent to {it['to']}"
+            detail = [what, it["address"], it["tracking"], it["subject"]]
+        when = f"{item_name(it['no'])}  ·  {friendly_date(it['dt'])} {it['dt']:%H:%M}  ·  logged by {it['staff']}"
+        if status == S_WAITING:
+            days = (date.today() - it["dt"].date()).days
+            badge, color = "Waiting" + (f" · {plural(days, 'day')}" if days else ""), AMBER
+        elif status == S_HANDED:
+            badge, color = "Handed over", GREEN
+            when += f"  ·  handed to {it['handed_to']} {friendly_date(it['handed_at'])}"
+        elif status == S_SENT:
+            badge, color = "Sent", TEAL
+        else:
+            badge, color = "Voided", DIM
+            when += f"  ·  voided: {it['void_reason']}"
+        self.post_cards.add(it["no"], title, ("  ·  ".join(x for x in detail if x), when), badge, color,
+                            quiet=status != S_WAITING, faded=status == S_VOIDED, flagged=it["tampered"])
+
     def refresh_table(self):
         query = self.search.value().lower()
-        selected = self.tree.selection()
-        self.tree.delete(*self.tree.get_children())
+        selected = self.post_cards.selection()
+        self.post_cards.clear()
         shown = 0
         for it in sorted(self.store.items().values(), key=lambda i: i["no"], reverse=True):
             status = self.store.status(it)
@@ -448,13 +453,10 @@ class PostView(tk.Frame):
                       it["to"], it["from"], what, it["tracking"], it["subject"], it["staff"], status_text(it))
             if query and not any(query in str(v).lower() for v in values + (it["address"],)):
                 continue
-            tags = ["odd" if shown % 2 else "even", status] + (["tampered"] if it["tampered"] else [])
-            self.tree.insert("", "end", iid=str(it["no"]), values=values, tags=tags)
+            self._add_card(it, status, what)
             shown += 1
-        self.tree.resort()
-        keep = [i for i in selected if self.tree.exists(i)]
-        if keep:
-            self.tree.selection_set(keep)
+        self.post_cards.finish()
+        self.post_cards.selection_set([i for i in selected if self.post_cards.exists(i)])
         if shown:
             self.empty_label.place_forget()
         else:
@@ -465,7 +467,7 @@ class PostView(tk.Frame):
             self.empty_label.place(relx=0.5, rely=0.5, anchor="center")
 
     def selected_item(self, what):
-        sel = self.tree.selection()
+        sel = self.post_cards.selection()
         if not sel:
             messagebox.showinfo(what, "Select an item in the list first.", parent=self.app)
             return None
