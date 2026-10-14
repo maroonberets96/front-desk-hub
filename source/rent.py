@@ -4,10 +4,10 @@ Rent & deposits
 
 Cash and cheque payments taken at the office, from receipt to bank:
 
-  1. Taken    Any staff PIN. A numbered receipt (PDF) is saved and opened for printing.
+  1. Taken    Any staff PIN. A numbered receipt (PDF) is saved and printed (see Settings → Receipts).
   2. Checked  A staff member marked as a checker (the office manager) counts the money and
-              puts it in the safe. Nobody can check a payment they took themselves, so a
-              payment the checker took can be checked by any other staff member.
+              puts it in the safe. A checker can check their own payments, and a payment a
+              checker took can also be checked by any other staff member.
   3. Banked   The payments paid in together become one deposit, with the bank date and the
               paying-in slip reference. The amount paid in must match their total.
 
@@ -28,7 +28,8 @@ Data files, in data/ next to the .exe:
                     members share their tenancy's key)
 and receipts/YYYY/ (next to data/) holds the PDF of every receipt exactly as issued.
 A new receipt goes straight to the default printer (via the bundled SumatraPDF.exe); if
-that fails it is opened to print by hand.
+that fails it is opened to print by hand. Settings → Receipts can make it ask first, or never
+print (for a test PC); the PDF is saved either way and the receipt number is shown instead.
 banking/YYYY/ holds the banking sheet printed for each deposit, to keep with the paying-in slip.
 """
 
@@ -84,6 +85,8 @@ RENT_TYPES = (R_RECEIPT, R_CHECKED, R_BANKED, R_CANCELLED, R_ACCEPTED)
 PAYMENT_KINDS = ["Rent", "Arrears", "Rent + arrears", "Key deposit", "Deposit", "Other"]
 DEFAULT_FIRST_RECEIPT = 6197  # the paper receipt book was used up to 6196; 6197-6199 are void on paper
 DEFAULT_UNBANKED_DAYS = 7
+# Settings → Receipts: print every new receipt, ask each time, or never (a test PC). The PDF is saved either way.
+PRINT_MODES = (("always", "Always print"), ("ask", "Ask each time"), ("never", "Never print (save the PDF only)"))
 
 S_AWAITING, S_IN_SAFE, S_BANKED, S_CANCELLED = "awaiting", "in_safe", "banked", "cancelled"
 STATUS_TEXT = {S_AWAITING: "Awaiting check", S_IN_SAFE: "In safe", S_BANKED: "Banked", S_CANCELLED: "Cancelled"}
@@ -1075,6 +1078,10 @@ class RentStore:
     def unbanked_days(self):
         return int(self.app.cfg.get("rent_unbanked_days", DEFAULT_UNBANKED_DAYS))
 
+    def print_mode(self):
+        mode = self.app.cfg.get("receipt_print", "always")
+        return mode if mode in dict(PRINT_MODES) else "always"
+
 
 def is_checker(staff):
     return bool(staff.get("checker"))
@@ -1205,9 +1212,12 @@ class RentView(tk.Frame):
         self.total_label.pack(side="right")
         self.problem_label = tk.Label(p, text="", font=(FONT, 9), fg=MUTED, bg=PANEL, anchor="w")
         self.problem_label.pack(fill="x")
-        self.take_btn = HoverButton(p, text="Take payment  ·  Print receipt", bg=GREEN, hover=GREEN_HOVER,
+        self.take_btn = HoverButton(p, text=self.take_text(), bg=GREEN, hover=GREEN_HOVER,
                                     font=(FONT, 13, "bold"), pady=11, command=self.take_payment)
         self.take_btn.pack(fill="x", pady=(4, 0))
+
+    def take_text(self):
+        return "Take payment  ·  Print receipt" if self.store.print_mode() == "always" else "Take payment"
 
     def _amount_box(self, parent, label, col, vcmd):
         tk.Label(parent, text=label, font=(FONT, 11, "bold"), fg=MUTED, bg=PANEL).grid(
@@ -1408,6 +1418,7 @@ class RentView(tk.Frame):
         self.receipt_cards.scroll_top()
 
     def refresh(self):
+        self.take_btn.config(text=self.take_text())  # Settings → Receipts may have changed the print mode
         self.refresh_cards()
         self.refresh_table()
         self.update_total()
@@ -1526,7 +1537,8 @@ class RentView(tk.Frame):
         dlg = PinDialog(self.app, self.app, "Take payment", f"Receipt {receipt}  ·  {fmt_money(cash + cheque)}",
                         [name + (f"  ·  ref {ref}" if ref else "  ·  new tenant (no ref)"), address,
                          self.kind + (f" – {details}" if details else ""), paid],
-                        confirm_text="Take payment & print receipt", cash_due=cash or None)
+                        confirm_text=("Take payment & print receipt" if self.store.print_mode() == "always"
+                                      else "Take payment"), cash_due=cash or None)
         result = dlg.show()
         if not result:
             self.app._pin_locked_out(dlg)
@@ -1582,7 +1594,18 @@ class RentView(tk.Frame):
                                    f"created:\n\n{e}\n\nSelect it and press Reprint to try again.",
                                    parent=self.app)
             return
-        print_file(path, self.app, f"receipt {p['receipt']} (it IS recorded)")
+        mode = self.store.print_mode()
+        if mode == "ask":
+            printing = messagebox.askyesno("Receipt", f"Receipt {p['receipt']} is recorded.\n\n"
+                                           "Print the receipt?", parent=self.app)
+        else:
+            printing = mode == "always"
+        if printing:
+            print_file(path, self.app, f"receipt {p['receipt']} (it IS recorded)")
+        else:
+            messagebox.showinfo("Receipt", f"Receipt number:  {p['receipt']}\n\nTell the tenant this number and "
+                                "write it on the money for checking. Reprint it any time from the list.",
+                                parent=self.app)
 
     def reprint_selected(self):
         sel = self.selected_payments()
@@ -1600,12 +1623,12 @@ class RentView(tk.Frame):
         takers = {p["taken_by"] for p in sel}
         total = sum(p["total"] for p in sel)
         cash, cheque = sum(p["cash"] for p in sel), sum(p["cheque"] for p in sel)
-        # A checker can't check their own payment, so when a checker took it anyone else may check it.
+        # A checker may check their own payments; when a checker took it, anyone else may check it too.
         checkers = {s["name"] for s in self.app.cfg["staff"] if is_checker(s)}
         taken_by_checkers = takers <= checkers
 
         def allow(staff):
-            if staff["name"] in takers:
+            if staff["name"] in takers and not is_checker(staff):
                 return "You took one of these payments, so someone else must check it"
             if not is_checker(staff) and not taken_by_checkers:
                 return "That PIN is not set up to check payments"
@@ -2242,6 +2265,14 @@ def build_receipts_tab(win, p):
     days.insert(0, str(store.unbanked_days()))
     days.pack(side="left", padx=6, ipady=3)
     tk.Label(row, text="days", font=(FONT, 10), fg=MUTED, bg=PANEL).pack(side="left")
+    row = tk.Frame(p, bg=PANEL)
+    row.pack(fill="x", pady=(10, 0))
+    tk.Label(row, text="Print new receipts:", font=(FONT, 10), fg=MUTED, bg=PANEL).pack(side="left", padx=(0, 10))
+    print_var = tk.StringVar(value=store.print_mode())
+    for value, text in PRINT_MODES:
+        tk.Radiobutton(row, text=text, value=value, variable=print_var, font=(FONT, 10), fg=TEXT, bg=PANEL,
+                       selectcolor=PANEL_2, activebackground=PANEL, activeforeground=TEXT, bd=0,
+                       highlightthickness=0).pack(side="left", padx=(0, 14))
 
     def save():
         new_org = {k: e.get().strip() for k, e in entries.items()}
@@ -2254,6 +2285,7 @@ def build_receipts_tab(win, p):
             return
         win.app.cfg["receipt_org"] = new_org
         win.app.cfg["rent_unbanked_days"] = n
+        win.app.cfg["receipt_print"] = print_var.get()
         win.app.save_cfg()
         win.app.rent_view.refresh()
         messagebox.showinfo("Receipts", "Saved. New receipts will use these details.", parent=win)

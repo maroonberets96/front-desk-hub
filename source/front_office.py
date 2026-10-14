@@ -2474,43 +2474,54 @@ class StockWindow(Dialog):
         return result[0]
 
     def received(self):
+        """The delivery is counted first; the drawer opens once it's recorded, to put the tokens in."""
         res = self._ask_quantities("Tokens received", "Tokens received", "Tokens added to the office's stock.",
                                    "Note (optional), e.g. delivery from the supplier", allow_zero=False)
         if not res:
             return
         wash, dry, note = res
         staff = self._confirm("Tokens received", f"Add {describe_items(wash, dry)}", [
-            "Added to the token stock.", note or "No note"], "Add to stock", TEAL, TEAL_HOVER)
-        if staff and self.app.record_event(TYPE_STOCK_IN, "", "", wash, dry, 0, staff["name"], notes=note,
-                                           parent=self):
+            "Added to the token stock. The drawer then opens so you can put them in.", note or "No note"],
+            "Add to stock", TEAL, TEAL_HOVER)
+        rec = staff and self.app.record_event(TYPE_STOCK_IN, "", "", wash, dry, 0, staff["name"], notes=note,
+                                              parent=self)
+        if rec:
             self.fill()
-            self.app.set_message(f"✓ Stock: {describe_items(wash, dry)} received by {staff['name']}", GREEN)
+            ok = self.app._open_drawer_after(rec, "token delivery")
+            self.app.set_message(f"✓ Stock: {describe_items(wash, dry)} received by {staff['name']}" +
+                                 ("" if ok else " (drawer did not open)"), GREEN if ok else YELLOW)
 
     def count(self):
+        """Like Count cash: PIN first, the drawer opens (logged as a no-sale), then the count is typed in."""
         stock = token_stock(self.app.records)
+        staff = self._confirm("Stock count", "Count the tokens", [
+            "The drawer opens. Count every washing and dryer token in the office, then put them back.",
+            "Opening the drawer is recorded in the log with your name."], "Open drawer", ORANGE, ORANGE_HOVER)
+        if not staff:
+            return
+        opened = self.app.record_event(TYPE_NOSALE, "", "", 0, 0, 0, staff["name"],
+                                       notes="Opened to count the tokens", parent=self)
+        if opened is None:
+            return
+        self.app._open_drawer_after(opened, "drawer opening")
         sub = ("Count every washing and dryer token in the office." if stock is None else
                f"Count every token in the office. The app expects {stock['wash']} washing and "
                f"{stock['dry']} dryer tokens.")
         res = self._ask_quantities("Stock count", "Stock count", sub, "Note (optional)", allow_zero=True)
         if not res:
+            self.app.set_message("Stock count cancelled. Nothing changed", MUTED)
             return
         wash, dry, note = res
         if stock is None:
-            lines = [f"Counted {wash} washing, {dry} dryer", "Opening count: stock is tracked from now on."]
             notes = f"Opening count: {wash} washing, {dry} dryer"
             diff_w, diff_d = wash, dry
         else:
             diff_w, diff_d = wash - stock["wash"], dry - stock["dry"]
-            lines = [f"Counted {wash} washing, {dry} dryer",
-                     f"Expected {stock['wash']} washing, {stock['dry']} dryer",
-                     "Matches the expected stock." if not (diff_w or diff_d) else
-                     f"Difference: washing {diff_w:+d}, dryer {diff_d:+d}. This is recorded."]
             notes = f"Counted {wash} washing, {dry} dryer; expected {stock['wash']}, {stock['dry']}"
         if note:
             notes += f". {note}"
-        staff = self._confirm("Stock count", "Record stock count", lines, "Record count", ORANGE, ORANGE_HOVER)
-        if staff and self.app.record_event(TYPE_STOCK_COUNT, "", "", diff_w, diff_d, 0, staff["name"], notes=notes,
-                                           parent=self):
+        if self.app.record_event(TYPE_STOCK_COUNT, "", "", diff_w, diff_d, 0, staff["name"], notes=notes,
+                                 parent=self):
             self.fill()
             off = stock is not None and (diff_w or diff_d)
             self.app.set_message(f"Stock count recorded by {staff['name']}" +
@@ -2771,8 +2782,8 @@ class SettingsWindow(Dialog):
             HoverButton(btns, text=text, font=(FONT, 10, "bold"), command=cmd).pack(side="left", padx=(8, 0))
         self._note(p, "Each person needs their own PIN (4–8 digits). The PIN identifies who did each thing. "
                       "Admins can void token sales, cancel receipts and open Settings. Checkers (the office "
-                      "manager) check rent payments and put them in the safe; nobody can check a payment they "
-                      "took themselves.")
+                      "manager) check rent payments and put them in the safe, including their own; other staff "
+                      "can't check a payment they took themselves.")
         self._fill_staff()
 
     def _fill_staff(self):
